@@ -1,0 +1,27 @@
+app:
+  name: "平和島ボートレース予想"
+  venue_code: "04"
+  venue_name: "平和島"
+  base_url: "https://www.boatrace.jp"
+
+scraper:
+  request_interval_sec: 1.5
+  timeout_sec: 15
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+  max_retries: 3
+
+model:
+  model_path: "model/lgbm_heiwajima.pkl"
+  min_expected_value: 1.0
+  default_strategy: "balance"
+
+betting:
+  min_bet: 100
+  bet_unit: 100
+  kelly_fraction: 0.5
+  max_bet_ratio: 0.3
+
+heiwajima:
+  course_1_win_rate: 0.449
+  narrow_first_mark: true
+  sashi_tendency: true
