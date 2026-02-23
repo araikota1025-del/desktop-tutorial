@@ -677,13 +677,18 @@ def unified_fetch_race(date: str, race_no: int) -> tuple[RaceInfo | None, dict, 
             race_info = openapi_to_race_info(openapi_data)
             extra_data["source"] = "openapi"
 
-            # 展示STを extra_data に反映
+            # 展示ST・進入コースを extra_data に反映
             st_dict = {}
+            course_dict = {}
             for r in race_info.racers:
                 if r.exhibit_st != 0.0:
                     st_dict[r.waku] = r.exhibit_st
+                if r.course_entry >= 1:
+                    course_dict[r.waku] = r.course_entry
             if st_dict:
                 extra_data["exhibit_st"] = st_dict
+            if course_dict:
+                extra_data["course_entry"] = course_dict
     except Exception:
         pass
 
