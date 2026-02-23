@@ -544,6 +544,34 @@ def fetch_odds_2tf(date: str, race_no: int) -> dict[str, float]:
     return odds_dict
 
 
+def fetch_odds_3f(date: str, race_no: int) -> dict[str, float]:
+    """3連複オッズを取得する
+
+    Returns:
+        {"1=2=3": 5.5, "1=2=4": 8.2, ...} の形式
+    """
+    html = fetch_page(
+        "/owpc/pc/race/odds3f",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return {}
+
+    soup = BeautifulSoup(html, "lxml")
+    odds_dict = _parse_odds_fallback_regex(soup, r"\d=\d=\d")
+
+    if not odds_dict:
+        for td in soup.select("td.oddsPoint"):
+            text = td.get_text(strip=True)
+            odds_val = _safe_float(text.replace(",", ""))
+            if odds_val > 0:
+                data_id = td.get("data-id", "")
+                if data_id and "=" in data_id:
+                    odds_dict[data_id] = odds_val
+
+    return odds_dict
+
+
 def fetch_odds_2kt(date: str, race_no: int) -> dict[str, float]:
     """2連複オッズを取得する
 
@@ -790,6 +818,8 @@ def unified_fetch_odds(date: str, race_no: int,
         try:
             if bet_type == "3t":
                 odds = fetch_odds_3t(date, race_no)
+            elif bet_type == "3f":
+                odds = fetch_odds_3f(date, race_no)
             elif bet_type == "2tf":
                 odds = fetch_odds_2tf(date, race_no)
             elif bet_type == "2kt":

@@ -306,3 +306,41 @@ def predict_quinella_probabilities(
 
     all_combos = sorted(combo_probs.items(), key=lambda x: x[1], reverse=True)
     return all_combos[:top_n]
+
+
+def predict_trio_probabilities(
+    race_info: RaceInfo,
+    top_n: int = 20,
+    course_entry: dict[int, int] | None = None,
+    exhibit_st: dict[int, float] | None = None,
+) -> list[tuple[str, float]]:
+    """3連複の確率を予測する（上位N件）
+
+    3連複は3着までの順番不問。全6通りの着順を合算する。
+    """
+    features_list, scores, waku_list = _plackett_luce_scores(
+        race_info, course_entry, exhibit_st
+    )
+    if scores is None:
+        return []
+
+    combo_probs: dict[str, float] = {}
+
+    for ci, cj, ck in combinations(range(len(waku_list)), 3):
+        total_prob = 0.0
+        for perm in permutations([ci, cj, ck]):
+            i, j, k = perm
+            remaining_1 = list(range(len(waku_list)))
+            p1 = scores[i] / scores[remaining_1].sum()
+            remaining_2 = [x for x in remaining_1 if x != i]
+            p2 = scores[j] / scores[remaining_2].sum()
+            remaining_3 = [x for x in remaining_2 if x != j]
+            p3 = scores[k] / scores[remaining_3].sum()
+            total_prob += p1 * p2 * p3
+
+        wakus = sorted([waku_list[ci], waku_list[cj], waku_list[ck]])
+        combo_str = f"{wakus[0]}={wakus[1]}={wakus[2]}"
+        combo_probs[combo_str] = float(total_prob)
+
+    all_combos = sorted(combo_probs.items(), key=lambda x: x[1], reverse=True)
+    return all_combos[:top_n]

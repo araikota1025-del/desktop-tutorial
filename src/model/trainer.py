@@ -100,18 +100,47 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
             # コース別基礎勝率
             course_base_wr = HEIWAJIMA_COURSE_WIN_RATE.get(waku, 0.1)
 
+            # 進入コース（新CSVフォーマット対応）
+            course = int(race.get(f"{prefix}course_entry", 0) or 0)
+            actual_course = course if 1 <= course <= 6 else waku
+
             # 風向×コース交互作用
             wind_speed = race.get("wind_speed", 0) or 0
             wave_height = race.get("wave_height", 0) or 0
             weather_str = str(race.get("weather", ""))
-            is_headwind = "向" in weather_str or "北" in weather_str
-            wind_course = (waku - 3.5) * 0.05 if is_headwind else (3.5 - waku) * 0.05
+            wind_dir_str = str(race.get("wind_direction", ""))
+            is_headwind = ("向" in weather_str or "北" in wind_dir_str
+                           or "北" in weather_str)
+            wind_course = ((actual_course - 3.5) * 0.05 if is_headwind
+                           else (3.5 - actual_course) * 0.05)
+
+            # 波高×モーター相互作用
+            wave_motor = 0.0
+            if wave_height >= 5 and motor_2r:
+                wave_motor = (float(motor_2r) - 30.0) / 30.0 * 0.3
+            elif wave_height >= 3 and motor_2r:
+                wave_motor = (float(motor_2r) - 30.0) / 30.0 * 0.15
+
+            # 強風の場合は風×コース影響を増幅
+            if wind_speed >= 5:
+                wind_course *= 1.5
+
+            # 進入コース有利度
+            if actual_course < waku:
+                in_course_adv = (waku - actual_course) * 0.1
+            elif actual_course > waku:
+                in_course_adv = -(actual_course - waku) * 0.05
+            else:
+                in_course_adv = 0.0
 
             # 複合スコア
             motor_boat = (float(motor_2r) * 0.6 + float(boat_2r) * 0.4
                           if motor_2r and boat_2r else 0.0)
             fl_risk = float(flying_count) * 0.5 + float(late_count) * 0.3
             rate_rank = float(win_rate_all) * rank_score / 8.0
+
+            # コース別基礎勝率（実進入コース反映）
+            course_base_wr = HEIWAJIMA_COURSE_WIN_RATE.get(actual_course, 0.1)
 
             feature = {
                 "waku": waku,
@@ -126,8 +155,8 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
                 "boat_3r": float(boat_3r),
                 "motor_boat_combined": motor_boat,
                 "course_base_win_rate": course_base_wr,
-                "actual_course": waku,  # CSVでは枠なり前提
-                "is_makunari": 1,
+                "actual_course": actual_course,
+                "is_makunari": 1 if actual_course == waku else 0,
                 "exhibit_time": float(exhibit_time),
                 "exhibit_st": float(exhibit_st),
                 "avg_start_timing": float(avg_st),
@@ -137,7 +166,8 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
                 "wind_speed": int(wind_speed),
                 "wave_height": int(wave_height),
                 "wind_course_interaction": wind_course,
-                "in_course_advantage": 0.0,
+                "wave_motor_interaction": wave_motor,
+                "in_course_advantage": in_course_adv,
                 "rate_rank_interaction": rate_rank,
             }
             race_features.append(feature)
@@ -160,6 +190,10 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
             groups.extend([race_id] * 6)
 
     features_df = pd.DataFrame(rows)
+
+    # wave_motor_interaction が無い場合は 0 埋め
+    if "wave_motor_interaction" not in features_df.columns:
+        features_df["wave_motor_interaction"] = 0.0
 
     # レース内の偏差値化
     _add_zscore_column(features_df, groups, "exhibit_time", "exhibit_time_zscore")
@@ -202,6 +236,7 @@ def train_model(
         "exhibit_time", "exhibit_st", "avg_start_timing",
         "flying_count", "late_count", "fl_risk_score",
         "wind_speed", "wave_height", "wind_course_interaction",
+        "wave_motor_interaction",
         "in_course_advantage", "rate_rank_interaction",
         "exhibit_time_zscore", "win_rate_zscore",
         "motor_2r_zscore", "exhibit_st_zscore",
@@ -297,6 +332,7 @@ def evaluate_model(model: lgb.Booster, features_df: pd.DataFrame, labels: np.nda
         "exhibit_time", "exhibit_st", "avg_start_timing",
         "flying_count", "late_count", "fl_risk_score",
         "wind_speed", "wave_height", "wind_course_interaction",
+        "wave_motor_interaction",
         "in_course_advantage", "rate_rank_interaction",
         "exhibit_time_zscore", "win_rate_zscore",
         "motor_2r_zscore", "exhibit_st_zscore",
