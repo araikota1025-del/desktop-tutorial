@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# 学習データ（大量CSVはリモートに上げない）
+data/raw/*.csv
+data/processed/*.csv
+
+# 学習済みモデル（ファイルサイズが大きいため）
+model/*.pkl
+model/*.bin
+model/*.txt
+
+# 環境
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ディレクトリ構造維持用のプレースホルダーは保持
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!model/.gitkeep
