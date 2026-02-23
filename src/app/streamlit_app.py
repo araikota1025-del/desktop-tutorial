@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 
 import streamlit as st
 import pandas as pd
+import time
 from datetime import date
 from itertools import permutations as itertools_permutations
 import random
@@ -19,6 +20,46 @@ from src.scraper.race_data import (
 )
 from src.model.predictor import predict_win_probabilities, predict_trifecta_probabilities
 from src.betting.optimizer import optimize_bets
+
+# ── キャッシュ設定 ──
+CACHE_TTL_SEC = 300  # 5分
+
+
+def _get_cache_key(date_str: str, race_no: int) -> str:
+    return f"cache_{date_str}_{race_no}"
+
+
+def get_cached_data(date_str: str, race_no: int):
+    """キャッシュからデータを取得。TTL内ならスクレイピングをスキップする。
+
+    Returns:
+        (race_info, odds, cache_hit): cache_hit=True ならキャッシュから返却
+    """
+    cache_key = _get_cache_key(date_str, race_no)
+    if cache_key in st.session_state:
+        cached = st.session_state[cache_key]
+        elapsed = time.time() - cached["timestamp"]
+        if elapsed < CACHE_TTL_SEC:
+            remaining = int(CACHE_TTL_SEC - elapsed)
+            return cached["race_info"], cached["odds"], True, remaining
+    return None, {}, False, 0
+
+
+def set_cache(date_str: str, race_no: int, race_info: RaceInfo, odds: dict):
+    """データをキャッシュに保存する"""
+    cache_key = _get_cache_key(date_str, race_no)
+    st.session_state[cache_key] = {
+        "race_info": race_info,
+        "odds": odds,
+        "timestamp": time.time(),
+    }
+
+
+def clear_all_cache():
+    """全キャッシュをクリアする"""
+    keys_to_remove = [k for k in st.session_state if k.startswith("cache_")]
+    for k in keys_to_remove:
+        del st.session_state[k]
 
 
 # ── デモデータ生成関数（前方定義） ──
@@ -171,24 +212,46 @@ with col1:
     )
 
 with col2:
-    if st.button("🔄 データ取得", use_container_width=True, type="primary"):
-        with st.spinner("boatrace.jp からデータ取得中..."):
-            race_info = fetch_race_list(date_str, race_no)
-            if race_info and race_info.racers:
-                race_info = fetch_before_info(date_str, race_no, race_info)
-                odds = fetch_odds_3t(date_str, race_no)
-                st.session_state["race_info"] = race_info
-                st.session_state["odds"] = odds
-                st.session_state["race_no"] = race_no
-                st.success(f"第{race_no}R のデータを取得しました")
-            else:
-                st.warning(
-                    "本日は平和島での開催がないか、データ取得に失敗しました。"
-                    "デモデータを表示します。"
-                )
-                st.session_state["race_info"] = _create_demo_data(race_no, date_str)
-                st.session_state["odds"] = _create_demo_odds()
-                st.session_state["race_no"] = race_no
+    btn_col1, btn_col2 = st.columns([3, 1])
+    with btn_col1:
+        fetch_btn = st.button("🔄 データ取得", use_container_width=True, type="primary")
+    with btn_col2:
+        clear_btn = st.button("🗑️ キャッシュクリア", use_container_width=True)
+
+    if clear_btn:
+        clear_all_cache()
+        for key in ["race_info", "odds", "race_no"]:
+            st.session_state.pop(key, None)
+        st.info("キャッシュをクリアしました")
+
+    if fetch_btn:
+        # まずキャッシュを確認
+        cached_info, cached_odds, cache_hit, remaining = get_cached_data(date_str, race_no)
+
+        if cache_hit:
+            st.session_state["race_info"] = cached_info
+            st.session_state["odds"] = cached_odds
+            st.session_state["race_no"] = race_no
+            st.success(f"第{race_no}R のデータをキャッシュから取得しました（残り {remaining} 秒）")
+        else:
+            with st.spinner("boatrace.jp からデータ取得中..."):
+                race_info = fetch_race_list(date_str, race_no)
+                if race_info and race_info.racers:
+                    race_info = fetch_before_info(date_str, race_no, race_info)
+                    odds = fetch_odds_3t(date_str, race_no)
+                    set_cache(date_str, race_no, race_info, odds)
+                    st.session_state["race_info"] = race_info
+                    st.session_state["odds"] = odds
+                    st.session_state["race_no"] = race_no
+                    st.success(f"第{race_no}R のデータを取得しました（5分間キャッシュされます）")
+                else:
+                    st.warning(
+                        "本日は平和島での開催がないか、データ取得に失敗しました。"
+                        "デモデータを表示します。"
+                    )
+                    st.session_state["race_info"] = _create_demo_data(race_no, date_str)
+                    st.session_state["odds"] = _create_demo_odds()
+                    st.session_state["race_no"] = race_no
 
     # レース情報表示
     if "race_info" in st.session_state:

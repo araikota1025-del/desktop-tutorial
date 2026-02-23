@@ -72,15 +72,42 @@ def fetch_racelist_for_training(date: str, race_no: int) -> dict | None:
     soup = BeautifulSoup(html, "lxml")
     race_data = {"date": date, "race_no": race_no}
 
-    # 各艇のデータを取得
-    tbody_list = soup.select("table.is-w748 tbody, table.is-w495 tbody, .table1 tbody")
+    # 各艇のデータを取得（is-w748 テーブルを優先）
+    racer_table = soup.select_one("table.is-w748")
+    if racer_table:
+        tbody_list = racer_table.select("tbody")
+    else:
+        tbody_list = soup.select(".table1 tbody")
     racers = []
 
-    for i, tbody in enumerate(tbody_list[:6]):
-        racer = {"waku": i + 1}
+    for tbody in tbody_list:
         tds = tbody.select("td")
         if not tds:
             continue
+
+        # 枠番を is-boatColor クラスから検出
+        waku = 0
+        for td in tds:
+            for cls in td.get("class", []):
+                color_match = re.search(r"is-boatColor(\d)", cls)
+                if color_match:
+                    waku = int(color_match.group(1))
+                    break
+            if waku:
+                break
+
+        # フォールバック: 最初のtdが1-6の単一数字か確認
+        if not waku:
+            first_text = tds[0].get_text(strip=True)
+            if re.match(r"^[1-6]$", first_text):
+                waku = int(first_text)
+
+        if not (1 <= waku <= 6):
+            continue
+        if any(r.get("waku") == waku for r in racers):
+            continue
+
+        racer = {"waku": waku}
 
         all_text = [td.get_text(strip=True) for td in tds]
         text_joined = " ".join(all_text)
@@ -114,6 +141,7 @@ def fetch_racelist_for_training(date: str, race_no: int) -> dict | None:
 
         racers.append(racer)
 
+    racers.sort(key=lambda r: r["waku"])
     race_data["racers"] = racers
     return race_data
 
