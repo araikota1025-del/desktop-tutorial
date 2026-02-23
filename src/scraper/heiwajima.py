@@ -6,15 +6,14 @@
 - 直前情報（展示タイム、展示ST、進入コース、気象）
 - レース結果
 
-URL パターン:
-  出走表: /asp/kyogi/{venue_code}/sp/syusso{day:02d}{race:02d}.htm
-  オッズ: /asp/kyogi/{venue_code}/sp/odds{day:02d}{race:02d}.htm
-  直前:   /asp/kyogi/{venue_code}/sp/chokuzen{day:02d}{race:02d}.htm
-  結果:   /asp/kyogi/{venue_code}/sp/result{day:02d}{race:02d}.htm
-  index:  /asp/heiwajima/sp/kyogi/kyogihtml/index.htm
+URL パターン (確認済み):
+  出走表: /asp/kyogi/04/sp/syusso{MMDD}.htm?slide={race}
+  オッズ: /asp/heiwajima/sp/kyogi/odds.asp?jyo=04&racenum={race}
+  直前:   /asp/kyogi/04/sp/chokuzen{MMDD}.htm?slide={race}
+  結果:   /asp/kyogi/04/sp/result{MMDD}.htm?slide={race}
 
-日数(day)は開催初日=1で、開催シリーズ内の何日目かを表す。
-index ページから当日の day 番号を自動検出する。
+MMDD は月日 (例: 0223), race はレース番号 (1-12)。
+_build_urls() で複数URLパターンを試行する。
 """
 
 import re
@@ -106,27 +105,43 @@ class HeiwajimaSupplement:
 
 # ── URL 生成・検出 ──
 
-def _build_urls(page_type: str, day_no: int, race_no: int) -> list[str]:
+def _build_urls(page_type: str, date_str: str, race_no: int) -> list[str]:
     """平和島SPページのURL候補リストを生成する
+
+    調査で判明した正確なURLパターン:
+    - 出走表: /asp/kyogi/04/sp/syusso{MMDD}.htm?slide={race}
+    - オッズ: /asp/heiwajima/sp/kyogi/odds.asp?jyo=04&racenum={race}
+    - 直前:   /asp/kyogi/04/sp/chokuzen{MMDD}.htm?slide={race}
+    - 結果:   /asp/kyogi/04/sp/result{MMDD}.htm?slide={race}
 
     Args:
         page_type: "syusso" / "odds" / "chokuzen" / "result"
-        day_no: 開催日数 (1-7)
+        date_str: "YYYYMMDD" 形式の日付
         race_no: レース番号 (1-12)
     """
-    d = str(day_no).zfill(2)
-    r = str(race_no).zfill(2)
+    # 月日を抽出
+    mm = date_str[4:6] if len(date_str) >= 8 else "01"
+    dd = date_str[6:8] if len(date_str) >= 8 else "01"
+    mmdd = f"{mm}{dd}"
 
-    urls = [
-        # パターン1: /asp/kyogi/{venue}/sp/{type}{day}{race}.htm
-        f"{HEIWAJIMA_BASE}/asp/kyogi/{d}/sp/{page_type}{d}{r}.htm",
-        # パターン2: venue code in path
-        f"{HEIWAJIMA_BASE}/asp/kyogi/{VENUE_CODE}/sp/{page_type}{d}{r}.htm",
-        # パターン3: index style
-        f"{HEIWAJIMA_BASE}/asp/heiwajima/sp/kyogi/{page_type}/{d}{r}.htm",
-        # パターン4: alternate path
-        f"{HEIWAJIMA_BASE}/asp/kyogi/sp/{page_type}{d}{r}.htm",
-    ]
+    urls = []
+
+    if page_type == "odds":
+        # オッズは ASP 動的ページが最優先
+        urls.extend([
+            f"{HEIWAJIMA_BASE}/asp/heiwajima/sp/kyogi/odds.asp?jyo={VENUE_CODE}&racenum={race_no}",
+            f"{HEIWAJIMA_BASE}/asp/kyogi/{VENUE_CODE}/sp/odds{mmdd}.htm?slide={race_no}",
+            f"{HEIWAJIMA_BASE}/asp/kyogi/{VENUE_CODE}/sp/odds{mmdd}{str(race_no).zfill(2)}.htm",
+        ])
+    else:
+        # 出走表/直前情報/結果: ?slide= パラメータでレース番号を指定
+        urls.extend([
+            f"{HEIWAJIMA_BASE}/asp/kyogi/{VENUE_CODE}/sp/{page_type}{mmdd}.htm?slide={race_no}",
+            f"{HEIWAJIMA_BASE}/asp/kyogi/{VENUE_CODE}/sp/{page_type}{mmdd}{str(race_no).zfill(2)}.htm",
+            # 旧パターン (day_no ベース) もフォールバックとして保持
+            f"{HEIWAJIMA_BASE}/asp/heiwajima/sp/kyogi/{page_type}/{mmdd}.htm?slide={race_no}",
+        ])
+
     return urls
 
 
@@ -139,62 +154,47 @@ def _fetch_with_fallback(urls: list[str]) -> Optional[str]:
     return None
 
 
-def discover_current_day(date_str: str = "") -> int:
-    """index ページから当日の開催日数を自動検出する
+def discover_race_links(date_str: str = "") -> dict:
+    """index ページから当日のレースリンク情報を取得する
 
     Returns:
-        day_no: 開催日数 (1-7)。検出失敗時は1-7を全て試す用に0を返す。
+        {"syusso_base": "...", "odds_base": "...", "day_no": N}
     """
     index_urls = [
         f"{HEIWAJIMA_BASE}/asp/heiwajima/sp/kyogi/kyogihtml/index.htm",
         f"{HEIWAJIMA_BASE}/sp/",
-        f"{HEIWAJIMA_BASE}/asp/kyogi/sp/index.htm",
     ]
 
     html = _fetch_with_fallback(index_urls)
     if not html:
-        return 0
+        return {}
 
     soup = BeautifulSoup(html, "lxml")
+    result = {}
 
-    # リンクからday番号を検出
-    # syusso{DD}{RR}.htm のパターンを探す
-    day_numbers = set()
+    # リンクから出走表/オッズのURLパターンを検出
     for a_tag in soup.select("a[href]"):
         href = a_tag.get("href", "")
-        m = re.search(r"syusso(\d{2})\d{2}\.htm", href)
-        if m:
-            day_numbers.add(int(m.group(1)))
-        m = re.search(r"odds(\d{2})\d{2}\.htm", href)
-        if m:
-            day_numbers.add(int(m.group(1)))
+        text = a_tag.get_text(strip=True)
 
-    if day_numbers:
-        return max(day_numbers)  # 最新の日を返す
+        # 出走表リンク
+        if "syusso" in href:
+            result["syusso_url"] = href
+            m = re.search(r"syusso(\d{4})", href)
+            if m:
+                result["mmdd"] = m.group(1)
 
-    # テキストからも検出を試みる
+        # オッズリンク
+        if "odds" in href:
+            result["odds_url"] = href
+
+    # テキストから開催日数を検出
     text = soup.get_text()
     day_match = re.search(r"(\d+)日目", text)
     if day_match:
-        return int(day_match.group(1))
+        result["day_no"] = int(day_match.group(1))
 
-    return 0
-
-
-def _find_day_no_for_date(date_str: str) -> list[int]:
-    """指定日付のday_noを試行するリストを返す"""
-    detected = discover_current_day(date_str)
-    if detected > 0:
-        # 検出成功: その日を最優先に前後も試す
-        candidates = [detected]
-        for delta in [1, -1, 2, -2]:
-            d = detected + delta
-            if 1 <= d <= 7:
-                candidates.append(d)
-        return candidates
-    else:
-        # 検出失敗: 1-7を全て試す
-        return list(range(1, 8))
+    return result
 
 
 # ── 出走表パーサー ──
@@ -773,29 +773,16 @@ def fetch_heiwajima_race(date_str: str, race_no: int,
     Args:
         date_str: "YYYYMMDD" 形式の日付
         race_no: レース番号 (1-12)
-        day_no: 開催日数 (0=自動検出)
+        day_no: (後方互換用、現在は使用しない)
 
     Returns:
         HeiwajimaRaceInfo
     """
     result = HeiwajimaRaceInfo(race_no=race_no, date=date_str)
 
-    # day_no の決定
-    if day_no <= 0:
-        day_candidates = _find_day_no_for_date(date_str)
-    else:
-        day_candidates = [day_no]
-
     # 出走表を取得
-    html = None
-    used_day = 0
-    for d in day_candidates:
-        urls = _build_urls("syusso", d, race_no)
-        html = _fetch_with_fallback(urls)
-        if html:
-            used_day = d
-            result.day_no = d
-            break
+    urls = _build_urls("syusso", date_str, race_no)
+    html = _fetch_with_fallback(urls)
 
     if html:
         soup = BeautifulSoup(html, "lxml")
@@ -812,28 +799,27 @@ def fetch_heiwajima_race(date_str: str, race_no: int,
             result.deadline = deadline_match.group(1)
 
     # 直前情報を取得
-    if used_day > 0:
-        before_urls = _build_urls("chokuzen", used_day, race_no)
-        before_html = _fetch_with_fallback(before_urls)
-        if before_html:
-            before_soup = BeautifulSoup(before_html, "lxml")
-            exhibit_times, exhibit_sts, weather = _parse_before_info(before_soup)
-            result.weather = weather
+    before_urls = _build_urls("chokuzen", date_str, race_no)
+    before_html = _fetch_with_fallback(before_urls)
+    if before_html:
+        before_soup = BeautifulSoup(before_html, "lxml")
+        exhibit_times, exhibit_sts, weather = _parse_before_info(before_soup)
+        result.weather = weather
 
-            # 選手データに直前情報をマージ
+        # 選手データに直前情報をマージ
+        for racer in result.racers:
+            if racer.waku in exhibit_times:
+                racer.exhibit_time = exhibit_times[racer.waku]
+            if racer.waku in exhibit_sts:
+                racer.exhibit_st = exhibit_sts[racer.waku]
+
+        # 進入コース
+        course_dict = _parse_course_entry(before_soup)
+        if course_dict:
+            result.course_entries = course_dict
             for racer in result.racers:
-                if racer.waku in exhibit_times:
-                    racer.exhibit_time = exhibit_times[racer.waku]
-                if racer.waku in exhibit_sts:
-                    racer.exhibit_st = exhibit_sts[racer.waku]
-
-            # 進入コース
-            course_dict = _parse_course_entry(before_soup)
-            if course_dict:
-                result.course_entries = course_dict
-                for racer in result.racers:
-                    if racer.waku in course_dict:
-                        racer.course_entry = course_dict[racer.waku]
+                if racer.waku in course_dict:
+                    racer.course_entry = course_dict[racer.waku]
 
     result.success = len(result.racers) >= 6
     return result
@@ -848,24 +834,18 @@ def fetch_heiwajima_odds(date_str: str, race_no: int,
         date_str: "YYYYMMDD" 形式の日付
         race_no: レース番号 (1-12)
         bet_type: "3t" / "2tf" / "2kt"
-        day_no: 開催日数 (0=自動検出)
+        day_no: (後方互換用、現在は使用しない)
 
     Returns:
         {"1-2-3": 12.5, ...} 形式のオッズ辞書
     """
-    if day_no <= 0:
-        day_candidates = _find_day_no_for_date(date_str)
-    else:
-        day_candidates = [day_no]
-
-    for d in day_candidates:
-        urls = _build_urls("odds", d, race_no)
-        html = _fetch_with_fallback(urls)
-        if html:
-            soup = BeautifulSoup(html, "lxml")
-            odds = _parse_odds_positional(soup, bet_type)
-            if odds:
-                return odds
+    urls = _build_urls("odds", date_str, race_no)
+    html = _fetch_with_fallback(urls)
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+        odds = _parse_odds_positional(soup, bet_type)
+        if odds:
+            return odds
 
     return {}
 
@@ -877,19 +857,13 @@ def fetch_heiwajima_result(date_str: str, race_no: int,
     Returns:
         着順の枠番リスト [1着枠, 2着枠, 3着枠, ...]
     """
-    if day_no <= 0:
-        day_candidates = _find_day_no_for_date(date_str)
-    else:
-        day_candidates = [day_no]
-
-    for d in day_candidates:
-        urls = _build_urls("result", d, race_no)
-        html = _fetch_with_fallback(urls)
-        if html:
-            soup = BeautifulSoup(html, "lxml")
-            result = _parse_result(soup)
-            if result:
-                return result
+    urls = _build_urls("result", date_str, race_no)
+    html = _fetch_with_fallback(urls)
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+        finish = _parse_result(soup)
+        if finish:
+            return finish
 
     return []
 

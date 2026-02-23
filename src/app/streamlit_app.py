@@ -304,7 +304,7 @@ with col2:
             source = cached_extra.get("source", "cache")
             st.success(f"第{race_no}R キャッシュから取得（残り {remaining}秒 / ソース: {source}）")
         else:
-            with st.spinner("データ取得中... (heiwajima.gr.jp → boatrace.jp)"):
+            with st.spinner("データ取得中... (OpenAPI → heiwajima.gr.jp → boatrace.jp)"):
                 race_info, odds, extra_data = unified_fetch_race(date_str, race_no)
 
                 if race_info and race_info.racers:
@@ -325,6 +325,7 @@ with col2:
 
                     source = extra_data.get("source", "unknown")
                     source_label = {
+                        "openapi": "BoatraceOpenAPI",
                         "heiwajima": "平和島公式",
                         "boatrace": "BOAT RACE公式",
                     }.get(source, source)
@@ -352,7 +353,9 @@ with col2:
         # ソース表示
         source = extra_data_display.get("source", "")
         source_html = ""
-        if source == "heiwajima":
+        if source == "openapi":
+            source_html = '<span class="source-tag source-heiwajima">OpenAPI</span>'
+        elif source == "heiwajima":
             source_html = '<span class="source-tag source-heiwajima">平和島公式</span>'
         elif source == "boatrace":
             source_html = '<span class="source-tag source-boatrace">BOAT RACE公式</span>'

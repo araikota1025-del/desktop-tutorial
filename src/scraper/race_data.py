@@ -646,13 +646,15 @@ def fetch_today_race_count(date: str) -> list[int]:
 
 
 # ── 統合データ取得 API ──
-# heiwajima.gr.jp をプライマリ、boatrace.jp をフォールバックとして使用
+# 優先順位: 1. BoatraceOpenAPI (JSON) → 2. heiwajima.gr.jp → 3. boatrace.jp
 
 def unified_fetch_race(date: str, race_no: int) -> tuple[RaceInfo | None, dict, dict]:
     """レースデータとオッズを統合的に取得する
 
-    heiwajima.gr.jp → boatrace.jp の順に試行し、
-    最も多くのデータを取得できたソースを使用する。
+    3段階のフォールバック:
+    1. BoatraceOpenAPI (GitHub Pages JSON) - 最も安定
+    2. heiwajima.gr.jp (平和島公式HTML) - 追加データあり
+    3. boatrace.jp (BOAT RACE公式HTML) - 最終手段
 
     Args:
         date: YYYYMMDD形式の日付
@@ -660,57 +662,74 @@ def unified_fetch_race(date: str, race_no: int) -> tuple[RaceInfo | None, dict, 
 
     Returns:
         (race_info, odds_dict, extra_data)
-        extra_data: {"source": "heiwajima"|"boatrace", "course_entry": {...}, "exhibit_st": {...}}
+        extra_data: {"source": str, "course_entry": dict, "exhibit_st": dict}
     """
     extra_data = {"source": "none", "course_entry": {}, "exhibit_st": {}}
-
-    # ── 1. heiwajima.gr.jp から取得 ──
     race_info = None
     odds_dict = {}
 
+    # ── 1. BoatraceOpenAPI (JSON) ──
     try:
-        from .heiwajima import (
-            fetch_heiwajima_race,
-            fetch_heiwajima_odds,
-            to_race_info,
-        )
+        from .openapi import fetch_openapi_race, openapi_to_race_info
 
-        hw_race = fetch_heiwajima_race(date, race_no)
-        if hw_race.success and len(hw_race.racers) >= 6:
-            race_info = to_race_info(hw_race)
-            extra_data["source"] = "heiwajima"
+        openapi_data = fetch_openapi_race(date, race_no)
+        if openapi_data and len(openapi_data.get("racers", [])) >= 6:
+            race_info = openapi_to_race_info(openapi_data)
+            extra_data["source"] = "openapi"
 
-            # 直前情報をRaceInfoのRacerに反映
-            for hr in hw_race.racers:
-                for r in race_info.racers:
-                    if r.waku == hr.waku:
-                        r.exhibit_st = hr.exhibit_st
-                        r.avg_start_timing = hr.avg_start_timing
-                        r.flying_count = hr.flying_count
-                        r.late_count = hr.late_count
-                        r.course_entry = hr.course_entry
-                        break
-
-            # 進入コース
-            if hw_race.course_entries:
-                extra_data["course_entry"] = hw_race.course_entries
-
-            # 展示ST
+            # 展示STを extra_data に反映
             st_dict = {}
-            for hr in hw_race.racers:
-                if hr.exhibit_st != 0.0:
-                    st_dict[hr.waku] = hr.exhibit_st
+            for r in race_info.racers:
+                if r.exhibit_st != 0.0:
+                    st_dict[r.waku] = r.exhibit_st
             if st_dict:
                 extra_data["exhibit_st"] = st_dict
-
-            # オッズ取得
-            odds_dict = fetch_heiwajima_odds(
-                date, race_no, "3t", day_no=hw_race.day_no
-            )
     except Exception:
         pass
 
-    # ── 2. boatrace.jp フォールバック ──
+    # ── 2. heiwajima.gr.jp (HTMLスクレイピング) ──
+    if race_info is None or not race_info.racers:
+        try:
+            from .heiwajima import (
+                fetch_heiwajima_race,
+                fetch_heiwajima_odds,
+                to_race_info,
+            )
+
+            hw_race = fetch_heiwajima_race(date, race_no)
+            if hw_race.success and len(hw_race.racers) >= 6:
+                race_info = to_race_info(hw_race)
+                extra_data["source"] = "heiwajima"
+
+                # 直前情報をRaceInfoのRacerに反映
+                for hr in hw_race.racers:
+                    for r in race_info.racers:
+                        if r.waku == hr.waku:
+                            r.exhibit_st = hr.exhibit_st
+                            r.avg_start_timing = hr.avg_start_timing
+                            r.flying_count = hr.flying_count
+                            r.late_count = hr.late_count
+                            r.course_entry = hr.course_entry
+                            break
+
+                # 進入コース
+                if hw_race.course_entries:
+                    extra_data["course_entry"] = hw_race.course_entries
+
+                # 展示ST
+                st_dict = {}
+                for hr in hw_race.racers:
+                    if hr.exhibit_st != 0.0:
+                        st_dict[hr.waku] = hr.exhibit_st
+                if st_dict:
+                    extra_data["exhibit_st"] = st_dict
+
+                # オッズ取得
+                odds_dict = fetch_heiwajima_odds(date, race_no, "3t")
+        except Exception:
+            pass
+
+    # ── 3. boatrace.jp (最終フォールバック) ──
     if race_info is None or not race_info.racers:
         try:
             race_info = fetch_race_list(date, race_no)
@@ -723,13 +742,11 @@ def unified_fetch_race(date: str, race_no: int) -> tuple[RaceInfo | None, dict, 
     if not odds_dict:
         try:
             odds_dict = fetch_odds_3t(date, race_no)
-            if odds_dict:
-                extra_data["source"] = extra_data.get("source", "boatrace")
         except Exception:
             pass
 
-    # ── 3. heiwajima 補完データ ──
-    if race_info and race_info.racers and extra_data["source"] == "boatrace":
+    # ── 4. heiwajima で補完 (boatrace.jpデータに追加情報を付ける) ──
+    if race_info and race_info.racers and extra_data["source"] in ("boatrace", "openapi"):
         try:
             from .heiwajima import fetch_heiwajima_supplement
             supplement = fetch_heiwajima_supplement(date, race_no)
@@ -749,6 +766,8 @@ def unified_fetch_odds(date: str, race_no: int,
                        day_no: int = 0) -> dict:
     """オッズを統合的に取得する
 
+    優先順位: heiwajima.gr.jp → boatrace.jp
+
     Args:
         bet_type: "3t" (3連単), "2tf" (2連単), "2kt" (2連複)
     """
@@ -757,7 +776,7 @@ def unified_fetch_odds(date: str, race_no: int,
     # heiwajima.gr.jp から
     try:
         from .heiwajima import fetch_heiwajima_odds
-        odds = fetch_heiwajima_odds(date, race_no, bet_type, day_no=day_no)
+        odds = fetch_heiwajima_odds(date, race_no, bet_type)
     except Exception:
         pass
 
