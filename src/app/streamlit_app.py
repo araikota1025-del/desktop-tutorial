@@ -17,8 +17,11 @@ import random
 from src.scraper.race_data import (
     RaceInfo, Racer, WeatherInfo,
     fetch_race_list, fetch_before_info, fetch_odds_3t,
-    debug_racelist_html,
 )
+try:
+    from src.scraper.race_data import debug_racelist_html
+except ImportError:
+    debug_racelist_html = None
 from src.model.predictor import predict_win_probabilities, predict_trifecta_probabilities
 from src.betting.optimizer import optimize_bets
 
@@ -246,7 +249,7 @@ with col2:
                     st.session_state["odds"] = odds
                     st.session_state["race_no"] = race_no
                     st.success(f"第{race_no}R のデータを取得しました（5分間キャッシュされます）")
-                    if debug_mode:
+                    if debug_mode and debug_racelist_html:
                         st.session_state["debug_html"] = debug_racelist_html(date_str, race_no)
                 else:
                     st.warning(
