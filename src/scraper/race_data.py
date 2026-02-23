@@ -97,20 +97,27 @@ def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
         info.deadline = deadline_el.get_text(strip=True)
 
     # 各艇の選手情報をパース
-    # まず is-w748 テーブル（出走表メイン）を優先的に探す
-    racer_table = soup.select_one("table.is-w748")
-    if racer_table:
-        tbody_list = racer_table.select("tbody")
-    else:
-        tbody_list = soup.select(".table1 tbody")
+    tbody_list = soup.select(".table1 tbody")
 
     for tbody in tbody_list:
         tds = tbody.select("td")
         if not tds:
             continue
 
-        # 枠番を is-boatColor クラスから検出（最も信頼できる方法）
+        all_text = [td.get_text(strip=True) for td in tds]
+        text_joined = " ".join(all_text)
+
+        # ── レーサーデータかどうかを内容で判定 ──
+        # 勝率（X.XX形式）が2つ以上 & 4桁の登番がなければスキップ
+        rates = re.findall(r"(\d+\.\d{2})", text_joined)
+        has_reg_no = bool(re.search(r"\d{4}", text_joined))
+        has_rank = bool(re.search(r"(A1|A2|B1|B2)", text_joined))
+        if len(rates) < 2 or not (has_reg_no or has_rank):
+            continue
+
+        # ── 枠番を検出 ──
         waku = 0
+        # 方法1: is-boatColor クラスから検出
         for td in tds:
             for cls in td.get("class", []):
                 color_match = re.search(r"is-boatColor(\d)", cls)
@@ -119,31 +126,40 @@ def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
                     break
             if waku:
                 break
-
-        # フォールバック: 最初のtdが1-6の単一数字か確認
+        # 方法2: boatColor がなければ最初のtdから単一数字を検出
         if not waku:
             first_text = tds[0].get_text(strip=True)
             if re.match(r"^[1-6]$", first_text):
                 waku = int(first_text)
 
-        # 枠番が取れない or 範囲外 → レーサーデータではないのでスキップ
         if not (1 <= waku <= 6):
             continue
-
-        # 既に同じ枠番が登録済みならスキップ（重複防止）
         if any(r.waku == waku for r in info.racers):
             continue
 
         racer = Racer(waku=waku)
 
-        # 選手名
-        name_el = tbody.select_one(".is-fs18, .is-fs14, a")
+        # ── 選手名を検出 ──
+        # 方法1: 専用クラス (.is-fs18, .is-fs14) から取得
+        name_el = tbody.select_one(".is-fs18, .is-fs14")
         if name_el:
             racer.name = re.sub(r"\s+", "", name_el.get_text(strip=True))
-
-        # テキストから数値を抽出
-        all_text = [td.get_text(strip=True) for td in tds]
-        text_joined = " ".join(all_text)
+        else:
+            # 方法2: 漢字・ひらがな・カタカナ2文字以上のテキストを探す
+            for td in tds:
+                td_text = td.get_text(strip=True)
+                # 数字のみ、英字のみ、級別はスキップ
+                if re.match(r"^[\d.%\-\s]+$", td_text):
+                    continue
+                if re.match(r"^(A1|A2|B1|B2)$", td_text):
+                    continue
+                # 日本語名前らしいテキスト（漢字/かな2文字以上）
+                name_candidate = re.sub(r"\s+", "", td_text)
+                if re.search(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]{2,}", name_candidate):
+                    # 締切、天候などのキーワードは除外
+                    if not re.search(r"(締切|予定|天候|風|波|気温|水温)", name_candidate):
+                        racer.name = name_candidate
+                        break
 
         # 登番を探す
         reg_match = re.search(r"(\d{4})", text_joined)
@@ -160,8 +176,7 @@ def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
         if branch_match:
             racer.branch = branch_match.group(1)
 
-        # 勝率を探す（小数点を含む数値）
-        rates = re.findall(r"(\d+\.\d{2})", text_joined)
+        # 勝率を代入
         if len(rates) >= 4:
             racer.win_rate_all = _safe_float(rates[0])
             racer.win_rate_2r_all = _safe_float(rates[1])
@@ -297,6 +312,46 @@ def fetch_odds_3t(date: str, race_no: int) -> dict[str, float]:
                     odds_dict[label] = odds_val
 
     return odds_dict
+
+
+def debug_racelist_html(date: str, race_no: int) -> list[dict]:
+    """デバッグ用: 出走表HTMLの各tbodyの構造を返す"""
+    html = fetch_page(
+        "/owpc/pc/race/racelist",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return [{"error": "HTML取得失敗"}]
+
+    soup = BeautifulSoup(html, "lxml")
+    result = []
+
+    tbody_list = soup.select(".table1 tbody")
+    for i, tbody in enumerate(tbody_list[:10]):
+        tds = tbody.select("td")
+        if not tds:
+            continue
+        td_texts = [td.get_text(strip=True)[:50] for td in tds[:8]]
+        td_classes = []
+        for td in tds[:8]:
+            cls = td.get("class", [])
+            td_classes.append(" ".join(cls) if cls else "-")
+
+        text_joined = " ".join(td.get_text(strip=True) for td in tds)
+        rates = re.findall(r"(\d+\.\d{2})", text_joined)
+        has_reg = bool(re.search(r"\d{4}", text_joined))
+
+        result.append({
+            "tbody_index": i,
+            "td_count": len(tds),
+            "td_texts": td_texts,
+            "td_classes": td_classes,
+            "rates_count": len(rates),
+            "has_4digit": has_reg,
+            "is_racer": len(rates) >= 2 and has_reg,
+        })
+
+    return result
 
 
 def fetch_today_race_count(date: str) -> list[int]:

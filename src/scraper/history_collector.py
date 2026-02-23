@@ -72,12 +72,8 @@ def fetch_racelist_for_training(date: str, race_no: int) -> dict | None:
     soup = BeautifulSoup(html, "lxml")
     race_data = {"date": date, "race_no": race_no}
 
-    # 各艇のデータを取得（is-w748 テーブルを優先）
-    racer_table = soup.select_one("table.is-w748")
-    if racer_table:
-        tbody_list = racer_table.select("tbody")
-    else:
-        tbody_list = soup.select(".table1 tbody")
+    # 各艇のデータを取得（内容ベースで判定）
+    tbody_list = soup.select(".table1 tbody")
     racers = []
 
     for tbody in tbody_list:
@@ -85,7 +81,17 @@ def fetch_racelist_for_training(date: str, race_no: int) -> dict | None:
         if not tds:
             continue
 
-        # 枠番を is-boatColor クラスから検出
+        all_text = [td.get_text(strip=True) for td in tds]
+        text_joined = " ".join(all_text)
+
+        # レーサーデータかどうかを内容で判定
+        rates = re.findall(r"(\d+\.\d{2})", text_joined)
+        has_reg_no = bool(re.search(r"\d{4}", text_joined))
+        has_rank = bool(re.search(r"(A1|A2|B1|B2)", text_joined))
+        if len(rates) < 2 or not (has_reg_no or has_rank):
+            continue
+
+        # 枠番を検出
         waku = 0
         for td in tds:
             for cls in td.get("class", []):
@@ -95,8 +101,6 @@ def fetch_racelist_for_training(date: str, race_no: int) -> dict | None:
                     break
             if waku:
                 break
-
-        # フォールバック: 最初のtdが1-6の単一数字か確認
         if not waku:
             first_text = tds[0].get_text(strip=True)
             if re.match(r"^[1-6]$", first_text):
@@ -108,9 +112,6 @@ def fetch_racelist_for_training(date: str, race_no: int) -> dict | None:
             continue
 
         racer = {"waku": waku}
-
-        all_text = [td.get_text(strip=True) for td in tds]
-        text_joined = " ".join(all_text)
 
         # 登番
         reg_match = re.search(r"(\d{4})", text_joined)
