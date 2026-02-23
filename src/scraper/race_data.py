@@ -97,12 +97,44 @@ def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
         info.deadline = deadline_el.get_text(strip=True)
 
     # 各艇の選手情報をパース
-    tbody_list = soup.select("table.is-w748 tbody, table.is-w495 tbody, .table1 tbody")
-    for i, tbody in enumerate(tbody_list[:6]):
-        racer = Racer(waku=i + 1)
+    # まず is-w748 テーブル（出走表メイン）を優先的に探す
+    racer_table = soup.select_one("table.is-w748")
+    if racer_table:
+        tbody_list = racer_table.select("tbody")
+    else:
+        tbody_list = soup.select(".table1 tbody")
+
+    for tbody in tbody_list:
         tds = tbody.select("td")
         if not tds:
             continue
+
+        # 枠番を is-boatColor クラスから検出（最も信頼できる方法）
+        waku = 0
+        for td in tds:
+            for cls in td.get("class", []):
+                color_match = re.search(r"is-boatColor(\d)", cls)
+                if color_match:
+                    waku = int(color_match.group(1))
+                    break
+            if waku:
+                break
+
+        # フォールバック: 最初のtdが1-6の単一数字か確認
+        if not waku:
+            first_text = tds[0].get_text(strip=True)
+            if re.match(r"^[1-6]$", first_text):
+                waku = int(first_text)
+
+        # 枠番が取れない or 範囲外 → レーサーデータではないのでスキップ
+        if not (1 <= waku <= 6):
+            continue
+
+        # 既に同じ枠番が登録済みならスキップ（重複防止）
+        if any(r.waku == waku for r in info.racers):
+            continue
+
+        racer = Racer(waku=waku)
 
         # 選手名
         name_el = tbody.select_one(".is-fs18, .is-fs14, a")
@@ -128,9 +160,6 @@ def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
         if branch_match:
             racer.branch = branch_match.group(1)
 
-        # 年齢・体重
-        age_weight = re.findall(r"(\d{2,3})", text_joined)
-
         # 勝率を探す（小数点を含む数値）
         rates = re.findall(r"(\d+\.\d{2})", text_joined)
         if len(rates) >= 4:
@@ -148,6 +177,9 @@ def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
             racer.boat_2r = _safe_float(rates[5])
 
         info.racers.append(racer)
+
+    # 枠番順にソート
+    info.racers.sort(key=lambda r: r.waku)
 
     return info
 
