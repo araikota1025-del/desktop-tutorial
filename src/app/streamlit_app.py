@@ -17,6 +17,7 @@ import random
 from src.scraper.race_data import (
     RaceInfo, Racer, WeatherInfo,
     fetch_race_list, fetch_before_info, fetch_odds_3t,
+    debug_racelist_html,
 )
 from src.model.predictor import predict_win_probabilities, predict_trifecta_probabilities
 from src.betting.optimizer import optimize_bets
@@ -192,6 +193,7 @@ with st.sidebar:
     }
 
     st.divider()
+    debug_mode = st.checkbox("デバッグモード", value=False)
     st.caption("予測は参考情報です。舟券購入は自己責任でお願いします。")
 
 
@@ -244,6 +246,8 @@ with col2:
                     st.session_state["odds"] = odds
                     st.session_state["race_no"] = race_no
                     st.success(f"第{race_no}R のデータを取得しました（5分間キャッシュされます）")
+                    if debug_mode:
+                        st.session_state["debug_html"] = debug_racelist_html(date_str, race_no)
                 else:
                     st.warning(
                         "本日は平和島での開催がないか、データ取得に失敗しました。"
@@ -286,6 +290,16 @@ with col2:
                 weather_cols[1].metric("風速", f"{w.wind_speed}m" if w.wind_speed else "-")
                 weather_cols[2].metric("波高", f"{w.wave_height}cm" if w.wave_height else "-")
                 weather_cols[3].metric("気温", f"{w.temperature}℃" if w.temperature else "-")
+
+    # デバッグ表示
+    if debug_mode and "debug_html" in st.session_state:
+        with st.expander("HTML構造デバッグ", expanded=True):
+            for item in st.session_state["debug_html"]:
+                is_racer = item.get("is_racer", False)
+                marker = "RACER" if is_racer else "SKIP"
+                st.markdown(f"**tbody[{item.get('tbody_index')}]** [{marker}] - td数: {item.get('td_count')}, 勝率数: {item.get('rates_count')}, 4桁番号: {item.get('has_4digit')}")
+                st.text(f"  テキスト: {item.get('td_texts')}")
+                st.text(f"  クラス:   {item.get('td_classes')}")
 
 st.divider()
 
