@@ -267,8 +267,212 @@ def fetch_before_info(date: str, race_no: int, race_info: RaceInfo | None = None
     return race_info
 
 
+def _parse_odds_table_positional(
+    soup: BeautifulSoup,
+    table_selector: str,
+    bet_type: str,
+) -> dict[str, float]:
+    """boatrace.jp のオッズテーブルを位置ベースで解析する。
+
+    boatrace.jp のオッズテーブルは以下の構造をしている:
+
+    【3連単 (odds3t)】
+    - contentsFrame1_inner 内の table 要素
+    - 6つの tbody ブロック（1着が1号艇〜6号艇に対応）
+    - 各 tbody には 5 行の tr（1着以外の残り5艇が2着候補）
+    - 各 tr には 4つの td.oddsPoint（2着以外の残り4艇が3着候補）
+    - 合計: 6 x 5 x 4 = 120 通り
+
+    【2連単 (odds2tf)】
+    - 6つの tbody ブロック（1着が1号艇〜6号艇に対応）
+    - 各 tbody には 5 行の tr（1着以外の残り5艇が2着候補）
+    - 各 tr には 1つの td.oddsPoint
+    - 合計: 6 x 5 = 30 通り
+
+    【2連複 (odds2kt)】
+    - 5つの tbody ブロック（小さい方の艇番 1〜5）
+    - 各 tbody には (6 - 艇番) 行の tr
+    - 合計: 5 + 4 + 3 + 2 + 1 = 15 通り
+
+    Args:
+        soup: パース済みの BeautifulSoup オブジェクト
+        table_selector: テーブルを特定するCSSセレクタ
+        bet_type: "3t" (3連単), "2tf" (2連単), "2kt" (2連複)
+
+    Returns:
+        {"1-2-3": 12.5, ...} の形式の辞書
+    """
+    odds_dict: dict[str, float] = {}
+    boats = [1, 2, 3, 4, 5, 6]
+
+    # テーブル要素を取得
+    table = soup.select_one(table_selector)
+    if not table:
+        # フォールバック: 複数のセレクタを試す
+        for selector in [
+            "div.contentsFrame1_inner table",
+            ".table1 table",
+            "table.is-w495",
+        ]:
+            table = soup.select_one(selector)
+            if table:
+                break
+    if not table:
+        return odds_dict
+
+    tbody_list = table.select("tbody")
+
+    if bet_type == "3t":
+        # ── 3連単: 6 tbody x 5 tr x 4 oddsPoint ──
+        for tbody_idx, tbody in enumerate(tbody_list):
+            if tbody_idx >= 6:
+                break
+            first = boats[tbody_idx]  # 1着の艇番
+
+            rows = tbody.select("tr")
+            # 2着候補: 1着以外の5艇
+            second_candidates = [b for b in boats if b != first]
+
+            for row_idx, row in enumerate(rows):
+                if row_idx >= len(second_candidates):
+                    break
+                second = second_candidates[row_idx]  # 2着の艇番
+
+                odds_cells = row.select("td.oddsPoint")
+                # 3着候補: 1着・2着以外の4艇
+                third_candidates = [b for b in boats if b != first and b != second]
+
+                for cell_idx, cell in enumerate(odds_cells):
+                    if cell_idx >= len(third_candidates):
+                        break
+                    third = third_candidates[cell_idx]  # 3着の艇番
+
+                    odds_val = _safe_float(
+                        cell.get_text(strip=True).replace(",", "")
+                    )
+                    if odds_val > 0:
+                        combo = f"{first}-{second}-{third}"
+                        odds_dict[combo] = odds_val
+
+    elif bet_type == "2tf":
+        # ── 2連単: 6 tbody x 5 tr x 1 oddsPoint ──
+        for tbody_idx, tbody in enumerate(tbody_list):
+            if tbody_idx >= 6:
+                break
+            first = boats[tbody_idx]  # 1着の艇番
+
+            rows = tbody.select("tr")
+            second_candidates = [b for b in boats if b != first]
+
+            for row_idx, row in enumerate(rows):
+                if row_idx >= len(second_candidates):
+                    break
+                second = second_candidates[row_idx]  # 2着の艇番
+
+                odds_cells = row.select("td.oddsPoint")
+                if odds_cells:
+                    odds_val = _safe_float(
+                        odds_cells[0].get_text(strip=True).replace(",", "")
+                    )
+                    if odds_val > 0:
+                        combo = f"{first}-{second}"
+                        odds_dict[combo] = odds_val
+
+    elif bet_type == "2kt":
+        # ── 2連複: 5 tbody（軸艇番 1〜5）──
+        for tbody_idx, tbody in enumerate(tbody_list):
+            if tbody_idx >= 5:
+                break
+            boat_a = boats[tbody_idx]  # 小さい方の艇番
+
+            rows = tbody.select("tr")
+            # 相手候補: boat_a より大きい艇番
+            partner_candidates = [b for b in boats if b > boat_a]
+
+            for row_idx, row in enumerate(rows):
+                if row_idx >= len(partner_candidates):
+                    break
+                boat_b = partner_candidates[row_idx]
+
+                odds_cells = row.select("td.oddsPoint")
+                if odds_cells:
+                    odds_val = _safe_float(
+                        odds_cells[0].get_text(strip=True).replace(",", "")
+                    )
+                    if odds_val > 0:
+                        combo = f"{boat_a}={boat_b}"
+                        odds_dict[combo] = odds_val
+
+    return odds_dict
+
+
+def _parse_odds_fallback_regex(
+    soup: BeautifulSoup,
+    combo_pattern: str,
+) -> dict[str, float]:
+    """フォールバック: テキスト内の組番+オッズをregexで抽出する。
+
+    位置ベースの解析が失敗した場合のフォールバック。
+    td.oddsPoint に data-id 属性がある場合や、
+    組番とオッズが同じセルに入っている場合に対応。
+
+    Args:
+        soup: パース済みの BeautifulSoup オブジェクト
+        combo_pattern: 組番の正規表現 (例: r"\\d-\\d-\\d")
+
+    Returns:
+        {"1-2-3": 12.5, ...} の形式の辞書
+    """
+    odds_dict: dict[str, float] = {}
+
+    # パターン1: td.oddsPoint に data-id 属性がある場合
+    for td in soup.select("td.oddsPoint"):
+        data_id = td.get("data-id", "")
+        if re.match(combo_pattern, data_id):
+            odds_val = _safe_float(td.get_text(strip=True).replace(",", ""))
+            if odds_val > 0:
+                odds_dict[data_id] = odds_val
+
+    if odds_dict:
+        return odds_dict
+
+    # パターン2: テーブル行内で組番テキストとオッズが並んでいる場合
+    for row in soup.select("table tr, .table1 tr"):
+        tds = row.select("td")
+        for i, td in enumerate(tds):
+            text = td.get_text(strip=True)
+            combo_match = re.search(f"({combo_pattern})", text)
+            if combo_match:
+                combo = combo_match.group(1)
+                # 同じセル内にオッズがある場合
+                odds_text = re.search(r"([\d,]+\.\d+)", text)
+                if odds_text:
+                    odds_val = _safe_float(odds_text.group(1).replace(",", ""))
+                    if odds_val > 0:
+                        odds_dict[combo] = odds_val
+                # 隣のセルにオッズがある場合
+                elif i + 1 < len(tds):
+                    next_text = tds[i + 1].get_text(strip=True)
+                    odds_match = re.search(r"([\d,]+\.\d+)", next_text)
+                    if odds_match:
+                        odds_val = _safe_float(
+                            odds_match.group(1).replace(",", "")
+                        )
+                        if odds_val > 0:
+                            odds_dict[combo] = odds_val
+
+    return odds_dict
+
+
 def fetch_odds_3t(date: str, race_no: int) -> dict[str, float]:
     """3連単オッズを取得する
+
+    boatrace.jp の odds3t ページの HTML テーブル構造:
+    - contentsFrame1_inner 配下の table 要素
+    - 6つの tbody（1着=1号艇〜6号艇）
+    - 各 tbody に 5行の tr（2着候補: 1着以外の5艇）
+    - 各 tr に 4つの td.oddsPoint（3着候補: 1着・2着以外の4艇）
+    - 合計 120 通り (6P3 = 6x5x4)
 
     Returns:
         {"1-2-3": 12.5, "1-2-4": 18.3, ...} の形式
@@ -281,35 +485,79 @@ def fetch_odds_3t(date: str, race_no: int) -> dict[str, float]:
         return {}
 
     soup = BeautifulSoup(html, "lxml")
-    odds_dict: dict[str, float] = {}
 
-    odds_tables = soup.select("table.is-w495, table.oddsTable, .table1 table")
-    for table in odds_tables:
-        rows = table.select("tr")
-        for row in rows:
-            tds = row.select("td")
-            for td in tds:
-                text = td.get_text(strip=True)
-                # "1-2-3" のような組番とオッズが含まれるパターン
-                combo_match = re.search(r"(\d)-(\d)-(\d)", text)
-                if combo_match:
-                    combo = f"{combo_match.group(1)}-{combo_match.group(2)}-{combo_match.group(3)}"
-                    # 同じtdまたは隣接tdからオッズを取得
-                    odds_text = re.search(r"([\d,]+\.\d+)", text)
-                    if odds_text:
-                        odds_val = _safe_float(odds_text.group(1).replace(",", ""))
-                        if odds_val > 0:
-                            odds_dict[combo] = odds_val
+    # メイン: 位置ベースの解析（テーブル内の tbody/tr/td.oddsPoint の
+    # 並び順から 1着-2着-3着 の組番を決定する）
+    table_selector = (
+        "div.contentsFrame1_inner table"
+    )
+    odds_dict = _parse_odds_table_positional(soup, table_selector, "3t")
 
-    # 別のHTMLパターン: オッズが別のtdにある場合
+    # フォールバック: regex ベースの解析
     if not odds_dict:
-        all_tds = soup.select("td.oddsPoint, td.odds-item")
-        for td in all_tds:
-            label = td.get("data-id", "")
-            if re.match(r"\d-\d-\d", label):
-                odds_val = _safe_float(td.get_text(strip=True).replace(",", ""))
-                if odds_val > 0:
-                    odds_dict[label] = odds_val
+        odds_dict = _parse_odds_fallback_regex(soup, r"\d-\d-\d")
+
+    return odds_dict
+
+
+def fetch_odds_2tf(date: str, race_no: int) -> dict[str, float]:
+    """2連単オッズを取得する
+
+    boatrace.jp の odds2tf ページの HTML テーブル構造:
+    - contentsFrame1_inner 配下の table 要素
+    - 6つの tbody（1着=1号艇〜6号艇）
+    - 各 tbody に 5行の tr（2着候補: 1着以外の5艇）
+    - 各 tr に 1つの td.oddsPoint
+    - 合計 30 通り (6P2 = 6x5)
+
+    Returns:
+        {"1-2": 3.5, "1-3": 5.2, ...} の形式
+    """
+    html = fetch_page(
+        "/owpc/pc/race/odds2tf",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return {}
+
+    soup = BeautifulSoup(html, "lxml")
+
+    table_selector = "div.contentsFrame1_inner table"
+    odds_dict = _parse_odds_table_positional(soup, table_selector, "2tf")
+
+    if not odds_dict:
+        odds_dict = _parse_odds_fallback_regex(soup, r"\d-\d")
+
+    return odds_dict
+
+
+def fetch_odds_2kt(date: str, race_no: int) -> dict[str, float]:
+    """2連複オッズを取得する
+
+    boatrace.jp の odds2kt ページの HTML テーブル構造:
+    - contentsFrame1_inner 配下の table 要素
+    - 5つの tbody（軸艇番 1〜5）
+    - 各 tbody に (6-軸艇番) 行の tr（相手: 軸より大きい艇番）
+    - 各 tr に 1つの td.oddsPoint
+    - 合計 15 通り (6C2 = 15)
+
+    Returns:
+        {"1=2": 2.1, "1=3": 4.8, ...} の形式（小さい番号=大きい番号）
+    """
+    html = fetch_page(
+        "/owpc/pc/race/odds2kt",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return {}
+
+    soup = BeautifulSoup(html, "lxml")
+
+    table_selector = "div.contentsFrame1_inner table"
+    odds_dict = _parse_odds_table_positional(soup, table_selector, "2kt")
+
+    if not odds_dict:
+        odds_dict = _parse_odds_fallback_regex(soup, r"\d=\d")
 
     return odds_dict
 
