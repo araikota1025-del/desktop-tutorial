@@ -86,8 +86,14 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
             win_rate_local = race.get(f"{prefix}win_rate_local", 0) or 0
             win_rate_2r_local = race.get(f"{prefix}win_rate_2r_local", 0) or 0
             motor_2r = race.get(f"{prefix}motor_2r", 0) or 0
+            motor_3r = race.get(f"{prefix}motor_3r", 0) or 0
             boat_2r = race.get(f"{prefix}boat_2r", 0) or 0
+            boat_3r = race.get(f"{prefix}boat_3r", 0) or 0
             exhibit_time = race.get(f"{prefix}exhibit_time", 0) or 0
+            exhibit_st = race.get(f"{prefix}exhibit_st", 0) or 0
+            avg_st = race.get(f"{prefix}avg_start_timing", 0) or 0
+            flying_count = race.get(f"{prefix}flying_count", 0) or 0
+            late_count = race.get(f"{prefix}late_count", 0) or 0
             rank_str = str(race.get(f"{prefix}rank", "B2"))
             rank_score = RANK_SCORE_MAP.get(rank_str, 1)
 
@@ -101,6 +107,12 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
             is_headwind = "向" in weather_str or "北" in weather_str
             wind_course = (waku - 3.5) * 0.05 if is_headwind else (3.5 - waku) * 0.05
 
+            # 複合スコア
+            motor_boat = (float(motor_2r) * 0.6 + float(boat_2r) * 0.4
+                          if motor_2r and boat_2r else 0.0)
+            fl_risk = float(flying_count) * 0.5 + float(late_count) * 0.3
+            rate_rank = float(win_rate_all) * rank_score / 8.0
+
             feature = {
                 "waku": waku,
                 "win_rate_all": float(win_rate_all),
@@ -109,17 +121,28 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
                 "win_rate_2r_local": float(win_rate_2r_local),
                 "rank_score": rank_score,
                 "motor_2r": float(motor_2r),
+                "motor_3r": float(motor_3r),
                 "boat_2r": float(boat_2r),
+                "boat_3r": float(boat_3r),
+                "motor_boat_combined": motor_boat,
                 "course_base_win_rate": course_base_wr,
+                "actual_course": waku,  # CSVでは枠なり前提
+                "is_makunari": 1,
                 "exhibit_time": float(exhibit_time),
+                "exhibit_st": float(exhibit_st),
+                "avg_start_timing": float(avg_st),
+                "flying_count": int(flying_count),
+                "late_count": int(late_count),
+                "fl_risk_score": fl_risk,
                 "wind_speed": int(wind_speed),
                 "wave_height": int(wave_height),
                 "wind_course_interaction": wind_course,
+                "in_course_advantage": 0.0,
+                "rate_rank_interaction": rate_rank,
             }
             race_features.append(feature)
 
             # ラベル: ランキング学習では「関連度」なので高い方が良い
-            # 1着=5, 2着=4, 3着=3, その他=0
             finish_rank = finish_map.get(waku, 0)
             if finish_rank == 1:
                 relevance = 5
@@ -137,24 +160,30 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np.ndarr
             groups.extend([race_id] * 6)
 
     features_df = pd.DataFrame(rows)
-    # 展示タイムの偏差値化（レース内）
-    features_df["exhibit_time_zscore"] = 0.0
-    features_df["win_rate_zscore"] = 0.0
+
+    # レース内の偏差値化
+    _add_zscore_column(features_df, groups, "exhibit_time", "exhibit_time_zscore")
+    _add_zscore_column(features_df, groups, "win_rate_all", "win_rate_zscore")
+    _add_zscore_column(features_df, groups, "motor_2r", "motor_2r_zscore")
+    _add_zscore_column(features_df, groups, "exhibit_st", "exhibit_st_zscore")
+    _add_zscore_column(features_df, groups, "boat_2r", "boat_2r_zscore")
+    _add_zscore_column(features_df, groups, "avg_start_timing", "avg_st_zscore")
 
     group_arr = np.array(groups)
     unique_groups = np.unique(group_arr)
-    for g in unique_groups:
-        mask = group_arr == g
-        et = features_df.loc[mask, "exhibit_time"]
-        if et.std() > 0.01:
-            features_df.loc[mask, "exhibit_time_zscore"] = (et - et.mean()) / et.std()
-
-        wr = features_df.loc[mask, "win_rate_all"]
-        if wr.std() > 0.01:
-            features_df.loc[mask, "win_rate_zscore"] = (wr - wr.mean()) / wr.std()
-
     print(f"特徴量生成: {len(features_df)} 行 ({len(unique_groups)} レース × 6艇)")
     return features_df, np.array(labels), group_arr
+
+
+def _add_zscore_column(df: pd.DataFrame, groups: list, src_col: str, dst_col: str):
+    """レース内のZスコアを計算して列を追加する"""
+    df[dst_col] = 0.0
+    group_arr = np.array(groups)
+    for g in np.unique(group_arr):
+        mask = group_arr == g
+        vals = df.loc[mask, src_col]
+        if vals.std() > 0.01:
+            df.loc[mask, dst_col] = (vals - vals.mean()) / vals.std()
 
 
 def train_model(
@@ -167,10 +196,16 @@ def train_model(
 
     feature_names = [
         "waku", "win_rate_all", "win_rate_2r_all", "win_rate_local",
-        "win_rate_2r_local", "rank_score", "motor_2r", "boat_2r",
-        "course_base_win_rate", "exhibit_time", "wind_speed",
-        "wave_height", "wind_course_interaction",
+        "win_rate_2r_local", "rank_score", "motor_2r", "motor_3r",
+        "boat_2r", "boat_3r", "motor_boat_combined",
+        "course_base_win_rate", "actual_course", "is_makunari",
+        "exhibit_time", "exhibit_st", "avg_start_timing",
+        "flying_count", "late_count", "fl_risk_score",
+        "wind_speed", "wave_height", "wind_course_interaction",
+        "in_course_advantage", "rate_rank_interaction",
         "exhibit_time_zscore", "win_rate_zscore",
+        "motor_2r_zscore", "exhibit_st_zscore",
+        "boat_2r_zscore", "avg_st_zscore",
     ]
 
     X = features_df[feature_names]
@@ -256,10 +291,16 @@ def evaluate_model(model: lgb.Booster, features_df: pd.DataFrame, labels: np.nda
     """モデルの評価指標を表示する"""
     feature_names = [
         "waku", "win_rate_all", "win_rate_2r_all", "win_rate_local",
-        "win_rate_2r_local", "rank_score", "motor_2r", "boat_2r",
-        "course_base_win_rate", "exhibit_time", "wind_speed",
-        "wave_height", "wind_course_interaction",
+        "win_rate_2r_local", "rank_score", "motor_2r", "motor_3r",
+        "boat_2r", "boat_3r", "motor_boat_combined",
+        "course_base_win_rate", "actual_course", "is_makunari",
+        "exhibit_time", "exhibit_st", "avg_start_timing",
+        "flying_count", "late_count", "fl_risk_score",
+        "wind_speed", "wave_height", "wind_course_interaction",
+        "in_course_advantage", "rate_rank_interaction",
         "exhibit_time_zscore", "win_rate_zscore",
+        "motor_2r_zscore", "exhibit_st_zscore",
+        "boat_2r_zscore", "avg_st_zscore",
     ]
 
     X = features_df[feature_names]

@@ -1,12 +1,16 @@
-"""着順確率を予測するモデル
+"""着順確率予測モデル
 
-初期版: 統計ベースのヒューリスティックモデル
-将来: LightGBMで学習済みモデルに差し替え
+モデル階層:
+1. LightGBMモデル（学習済みモデルが存在する場合）
+2. 拡張統計モデル（デフォルト: 平和島固有の重み付けヒューリスティック）
+
+拡張統計モデルは平和島の過去データ分析に基づいた重み設計で、
+LightGBMモデルが利用可能になるまでの高精度な代替として機能する。
 """
 
 import numpy as np
 from pathlib import Path
-from itertools import permutations
+from itertools import permutations, combinations
 
 from ..scraper.race_data import RaceInfo
 from ..features.pipeline import build_race_features
@@ -15,43 +19,54 @@ MODEL_PATH = Path(__file__).parent.parent.parent / "model" / "lgbm_heiwajima.pkl
 
 
 def _compute_strength_scores(features_list: list[dict]) -> np.ndarray:
-    """各艇の強さスコアを算出する（統計ベース）
+    """各艇の強さスコアを算出する
 
-    平和島特化の重み付け。将来LightGBMモデルに置き換える箇所。
+    学習済みモデルがある場合はそちらを使用。
+    ない場合は平和島の特性を反映した拡張統計モデルを使用。
 
-    スコア構成（合計約 5.0 前後）:
-    - コース別基礎勝率: 最大 1.35 (weight=3.0, max=0.449)
-    - 全国勝率:         最大 2.00 (weight=2.0)
-    - 当地勝率:         最大 1.50 (weight=1.5)
-    - 級別:             最大 0.80 (weight=0.2)
-    - モーター:         最大 1.00 (weight=1.0)
-    - ボート:           最大 0.50 (weight=0.5)
-    - 展示タイム:       ±0.30
-    - 展示ST:           ±0.40（新規）
-    - モーター偏差値:   ±0.20（新規）
-    - 風×コース:        ±0.175
-    - 波×モーター:      ±0.30（新規）
+    スコア構成（拡張統計モデル）:
+    - コース別基礎勝率:    最大 1.80 (weight=4.0, max=0.449)
+    - 全国勝率:            最大 2.00 (weight=2.0)
+    - 当地勝率:            最大 1.50 (weight=1.5)
+    - 級別:                最大 0.80 (weight=0.2)
+    - モーター:            最大 1.00 (weight=1.0)
+    - ボート:              最大 0.50 (weight=0.5)
+    - モーター+ボート複合:  ±0.30
+    - 展示タイム偏差値:     ±0.35
+    - 展示ST偏差値:        ±0.45
+    - 平均ST偏差値:        ±0.30
+    - F/Lリスク:           -0.30 max
+    - 風×コース:           ±0.20
+    - 波×モーター:         ±0.30
+    - 進入コース有利度:     ±0.20
+    - 勝率×級別:           ±0.20
     """
-    # 学習済みモデルが存在する場合はそちらを使用
+    # 学習済みモデルが存在する場合
     if MODEL_PATH.exists():
-        return _predict_with_lgbm(features_list)
+        try:
+            scores = _predict_with_lgbm(features_list)
+            if scores is not None:
+                return scores
+        except Exception:
+            pass
 
     scores = []
     for f in features_list:
         score = 0.0
 
-        # コース別基礎勝率（最重要: 平和島はコースの影響大）
-        score += f.get("course_base_win_rate", 0.1) * 3.0
+        # コース別基礎勝率（最重要: 平和島はイン有利が際立つ）
+        score += f.get("course_base_win_rate", 0.1) * 4.0
 
-        # 全国勝率（選手の実力）
+        # 全国勝率（選手の実力指標）
         win_rate = f.get("win_rate_all", 4.0)
         score += (win_rate / 8.0) * 2.0
 
-        # 当地勝率（平和島での実績）
+        # 当地勝率（平和島での実績、全国勝率より重要度は若干低い）
         local_rate = f.get("win_rate_local", 0.0)
         if local_rate > 0:
             score += (local_rate / 8.0) * 1.5
         else:
+            # 当地勝率がない場合は全国勝率で代替
             score += (win_rate / 8.0) * 0.5
 
         # 級別スコア
@@ -65,32 +80,49 @@ def _compute_strength_scores(features_list: list[dict]) -> np.ndarray:
         boat = f.get("boat_2r", 30.0)
         score += (boat / 60.0) * 0.5
 
-        # 展示タイム偏差値（低い方が速い → マイナスほど良い）
+        # モーター+ボート複合スコアの偏差値
+        combined = f.get("motor_boat_combined", 0.0)
+        if combined > 0:
+            # 平均35程度を想定
+            score += (combined - 35.0) / 20.0 * 0.3
+
+        # ── 直前情報 ──
+
+        # 展示タイム偏差値（低い=速い → マイナスほど良い）
         et_z = f.get("exhibit_time_zscore", 0.0)
-        score -= et_z * 0.3
+        score -= et_z * 0.35
 
-        # ── 新規特徴量 ──
-
-        # 展示スタートタイミング（STが小さいほどスタートが速い）
+        # 展示ST偏差値（小さいほどスタートが速い → マイナスほど良い）
         st_z = f.get("exhibit_st_zscore", 0.0)
-        score -= st_z * 0.4  # STが速い選手にボーナス
+        score -= st_z * 0.45
 
-        # モーター偏差値（レース内での相対的なモーター性能）
-        motor_z = f.get("motor_2r_zscore", 0.0)
-        score += motor_z * 0.2
+        # 平均ST偏差値
+        avg_st_z = f.get("avg_st_zscore", 0.0)
+        score -= avg_st_z * 0.30
 
-        # 風×コース相互作用
+        # F/Lリスク（フライング経験者はスタートが慎重=不利）
+        fl_risk = f.get("fl_risk_score", 0.0)
+        score -= fl_risk * 0.15
+
+        # ── 気象×コース相互作用 ──
         score += f.get("wind_course_interaction", 0.0) * 1.0
 
-        # 波×モーター相互作用（荒天ではモーターの差が出る）
+        # 波×モーター
         score += f.get("wave_motor_interaction", 0.0)
+
+        # 進入コース有利度
+        score += f.get("in_course_advantage", 0.0) * 2.0
+
+        # 勝率×級別相互作用
+        rate_rank = f.get("rate_rank_interaction", 0.0)
+        score += rate_rank * 0.1
 
         scores.append(max(score, 0.01))
 
     return np.array(scores)
 
 
-def _predict_with_lgbm(features_list: list[dict]) -> np.ndarray:
+def _predict_with_lgbm(features_list: list[dict]) -> np.ndarray | None:
     """LightGBMモデルで予測する"""
     try:
         import joblib
@@ -99,20 +131,31 @@ def _predict_with_lgbm(features_list: list[dict]) -> np.ndarray:
         model = joblib.load(MODEL_PATH)
         feature_names = [
             "waku", "win_rate_all", "win_rate_2r_all", "win_rate_local",
-            "win_rate_2r_local", "rank_score", "motor_2r", "boat_2r",
-            "course_base_win_rate", "exhibit_time", "wind_speed",
-            "wave_height", "wind_course_interaction",
+            "win_rate_2r_local", "rank_score", "motor_2r", "motor_3r",
+            "boat_2r", "boat_3r", "motor_boat_combined",
+            "course_base_win_rate", "actual_course", "is_makunari",
+            "exhibit_time", "exhibit_st", "avg_start_timing",
+            "flying_count", "late_count", "fl_risk_score",
+            "wind_speed", "wave_height", "wind_course_interaction",
+            "wave_motor_interaction", "in_course_advantage",
+            "rate_rank_interaction",
             "exhibit_time_zscore", "win_rate_zscore",
+            "motor_2r_zscore", "exhibit_st_zscore",
+            "boat_2r_zscore", "avg_st_zscore",
         ]
         df = pd.DataFrame(features_list)
         for col in feature_names:
             if col not in df.columns:
                 df[col] = 0.0
-        predictions = model.predict(df[feature_names])
+        # モデルの特徴量に合わせる（モデルが期待する列のみ）
+        model_features = getattr(model, "feature_name_", feature_names)
+        for col in model_features:
+            if col not in df.columns:
+                df[col] = 0.0
+        predictions = model.predict(df[model_features])
         return np.array(predictions)
     except Exception:
-        # フォールバック
-        return np.array([f.get("win_rate_all", 4.0) for f in features_list])
+        return None
 
 
 def predict_win_probabilities(
@@ -124,7 +167,7 @@ def predict_win_probabilities(
 
     Args:
         race_info: レース情報
-        course_entry: 進入コース（heiwajima.gr.jpから取得）
+        course_entry: 進入コース
         exhibit_st: 展示スタートタイミング
 
     Returns:
@@ -136,8 +179,9 @@ def predict_win_probabilities(
 
     scores = _compute_strength_scores(features_list)
 
-    # softmax で確率に変換
-    exp_scores = np.exp(scores - np.max(scores))
+    # softmax で確率に変換（温度パラメータで鋭さを調整）
+    temperature = 1.0
+    exp_scores = np.exp((scores - np.max(scores)) / temperature)
     probabilities = exp_scores / exp_scores.sum()
 
     return {
@@ -168,7 +212,7 @@ def predict_trifecta_probabilities(
 ) -> list[tuple[str, float]]:
     """3連単の着順確率を予測する（上位N件）
 
-    簡易版: 1着確率をベースに条件付き確率で近似
+    Plackett-Luce モデルで全120通りの確率を計算する。
     """
     features_list, scores, waku_list = _plackett_luce_scores(
         race_info, course_entry, exhibit_st
@@ -176,7 +220,6 @@ def predict_trifecta_probabilities(
     if scores is None:
         return []
 
-    # 全120通りの確率を計算（Plackett-Luce モデルの簡易版）
     all_combos = []
     for perm in permutations(range(len(waku_list)), 3):
         i, j, k = perm
@@ -196,16 +239,20 @@ def predict_trifecta_probabilities(
         combo_str = f"{waku_list[i]}-{waku_list[j]}-{waku_list[k]}"
         all_combos.append((combo_str, float(prob)))
 
-    # 確率の高い順にソート
     all_combos.sort(key=lambda x: x[1], reverse=True)
     return all_combos[:top_n]
 
 
 def predict_exacta_probabilities(
-    race_info: RaceInfo, top_n: int = 30
+    race_info: RaceInfo,
+    top_n: int = 30,
+    course_entry: dict[int, int] | None = None,
+    exhibit_st: dict[int, float] | None = None,
 ) -> list[tuple[str, float]]:
     """2連単の着順確率を予測する（上位N件）"""
-    features_list, scores, waku_list = _plackett_luce_scores(race_info)
+    features_list, scores, waku_list = _plackett_luce_scores(
+        race_info, course_entry, exhibit_st
+    )
     if scores is None:
         return []
 
@@ -226,22 +273,26 @@ def predict_exacta_probabilities(
 
 
 def predict_quinella_probabilities(
-    race_info: RaceInfo, top_n: int = 15
+    race_info: RaceInfo,
+    top_n: int = 15,
+    course_entry: dict[int, int] | None = None,
+    exhibit_st: dict[int, float] | None = None,
 ) -> list[tuple[str, float]]:
     """2連複の確率を予測する（上位N件）
 
     2連複は順番不問なので、P(A-B) + P(B-A) を合算する。
     """
-    features_list, scores, waku_list = _plackett_luce_scores(race_info)
+    features_list, scores, waku_list = _plackett_luce_scores(
+        race_info, course_entry, exhibit_st
+    )
     if scores is None:
         return []
 
-    from itertools import combinations
     combo_probs: dict[str, float] = {}
 
     for ci, cj in combinations(range(len(waku_list)), 2):
-        # A→B の確率
         remaining = list(range(len(waku_list)))
+        # A→B の確率
         p_ab = (scores[ci] / scores[remaining].sum()) * (
             scores[cj] / scores[[x for x in remaining if x != ci]].sum()
         )

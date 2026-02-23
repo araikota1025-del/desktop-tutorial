@@ -1,4 +1,9 @@
-"""平和島ボートレース予想アプリ - Streamlit UI"""
+"""平和島ボートレース予想アプリ - Streamlit UI
+
+データソース:
+  1. heiwajima.gr.jp (平和島公式) - プライマリ
+  2. boatrace.jp (BOAT RACE公式) - フォールバック
+"""
 
 import sys
 from pathlib import Path
@@ -16,17 +21,19 @@ import random
 
 from src.scraper.race_data import (
     RaceInfo, Racer, WeatherInfo,
+    unified_fetch_race, unified_fetch_odds,
     fetch_race_list, fetch_before_info, fetch_odds_3t,
 )
 try:
     from src.scraper.race_data import debug_racelist_html
 except ImportError:
     debug_racelist_html = None
-try:
-    from src.scraper.heiwajima import fetch_heiwajima_supplement
-except ImportError:
-    fetch_heiwajima_supplement = None
-from src.model.predictor import predict_win_probabilities, predict_trifecta_probabilities
+from src.model.predictor import (
+    predict_win_probabilities,
+    predict_trifecta_probabilities,
+    predict_exacta_probabilities,
+    predict_quinella_probabilities,
+)
 from src.betting.optimizer import optimize_bets
 
 # ── キャッシュ設定 ──
@@ -45,17 +52,24 @@ def get_cached_data(date_str: str, race_no: int):
         elapsed = time.time() - cached["timestamp"]
         if elapsed < CACHE_TTL_SEC:
             remaining = int(CACHE_TTL_SEC - elapsed)
-            return cached["race_info"], cached["odds"], cached.get("supplement"), True, remaining
-    return None, {}, None, False, 0
+            return (
+                cached["race_info"],
+                cached["odds"],
+                cached.get("extra_data", {}),
+                True,
+                remaining,
+            )
+    return None, {}, {}, False, 0
 
 
-def set_cache(date_str: str, race_no: int, race_info: RaceInfo, odds: dict, supplement=None):
+def set_cache(date_str: str, race_no: int, race_info: RaceInfo,
+              odds: dict, extra_data: dict = None):
     """データをキャッシュに保存する"""
     cache_key = _get_cache_key(date_str, race_no)
     st.session_state[cache_key] = {
         "race_info": race_info,
         "odds": odds,
-        "supplement": supplement,
+        "extra_data": extra_data or {},
         "timestamp": time.time(),
     }
 
@@ -113,18 +127,36 @@ def _create_demo_data(race_no: int, date_str: str) -> RaceInfo:
     )
 
 
-def _create_demo_odds() -> dict[str, float]:
-    """デモ用の3連単オッズ"""
+def _create_demo_odds(bet_type: str = "3連単") -> dict[str, float]:
+    """デモ用オッズ"""
     rng = random.Random(123)
     odds = {}
-    for perm in itertools_permutations(range(1, 7), 3):
-        combo = f"{perm[0]}-{perm[1]}-{perm[2]}"
-        base = 10.0
-        if perm[0] <= 2:
-            base *= 0.5
-        if perm[0] >= 5:
-            base *= 3.0
-        odds[combo] = round(base * rng.uniform(0.5, 10.0), 1)
+
+    if bet_type == "3連単":
+        for perm in itertools_permutations(range(1, 7), 3):
+            combo = f"{perm[0]}-{perm[1]}-{perm[2]}"
+            base = 10.0
+            if perm[0] <= 2:
+                base *= 0.5
+            if perm[0] >= 5:
+                base *= 3.0
+            odds[combo] = round(base * rng.uniform(0.5, 10.0), 1)
+    elif bet_type == "2連単":
+        for perm in itertools_permutations(range(1, 7), 2):
+            combo = f"{perm[0]}-{perm[1]}"
+            base = 5.0
+            if perm[0] <= 2:
+                base *= 0.5
+            odds[combo] = round(base * rng.uniform(0.5, 5.0), 1)
+    elif bet_type == "2連複":
+        from itertools import combinations
+        for c in combinations(range(1, 7), 2):
+            combo = f"{c[0]}={c[1]}"
+            base = 3.0
+            if 1 in c:
+                base *= 0.5
+            odds[combo] = round(base * rng.uniform(0.5, 5.0), 1)
+
     return odds
 
 
@@ -136,7 +168,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── カスタムCSS（スマホ最適化） ──
+# ── カスタムCSS ──
 st.markdown("""
 <style>
     @media (max-width: 768px) {
@@ -153,6 +185,16 @@ st.markdown("""
         color: white;
         margin-bottom: 16px;
     }
+    .source-tag {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: bold;
+    }
+    .source-heiwajima { background: #4CAF50; color: white; }
+    .source-boatrace { background: #2196F3; color: white; }
+    .source-demo { background: #FF9800; color: white; }
     .risk-low { color: #2E7D32; font-weight: bold; }
     .risk-mid { color: #F57F17; font-weight: bold; }
     .risk-high { color: #C62828; font-weight: bold; }
@@ -179,7 +221,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── サイドバー（設定） ──
+# ── サイドバー ──
 with st.sidebar:
     st.header("設定")
     target_date = st.date_input("対象日", value=today)
@@ -187,6 +229,14 @@ with st.sidebar:
         "デフォルト掛け金（円）", min_value=100, max_value=100000,
         value=3000, step=100,
     )
+
+    bet_type_label = st.selectbox(
+        "舟券種別",
+        ["3連単", "2連単", "2連複"],
+        help="3連単: 1-2-3着を順番通り\n2連単: 1-2着を順番通り\n2連複: 1-2着を順不同",
+    )
+    bet_type_map = {"3連単": "3t", "2連単": "2tf", "2連複": "2kt"}
+
     strategy = st.selectbox(
         "戦略モード",
         ["安定重視", "バランス", "的中率重視", "回収率重視", "万舟狙い"],
@@ -207,11 +257,6 @@ with st.sidebar:
     }
 
     st.divider()
-    use_heiwajima = st.checkbox(
-        "平和島公式サイトから追加データ取得",
-        value=True,
-        help="heiwajima.gr.jp から展示ST・進入コース等を取得",
-    )
     debug_mode = st.checkbox("デバッグモード", value=False)
     st.caption("予測は参考情報です。舟券購入は自己責任でお願いします。")
 
@@ -237,49 +282,55 @@ with col2:
     with btn_col1:
         fetch_btn = st.button("🔄 データ取得", use_container_width=True, type="primary")
     with btn_col2:
-        clear_btn = st.button("🗑️ キャッシュクリア", use_container_width=True)
+        clear_btn = st.button("🗑️ クリア", use_container_width=True)
 
     if clear_btn:
         clear_all_cache()
-        for key in ["race_info", "odds", "race_no", "supplement"]:
+        for key in ["race_info", "odds", "race_no", "extra_data"]:
             st.session_state.pop(key, None)
         st.info("キャッシュをクリアしました")
 
     if fetch_btn:
-        # まずキャッシュを確認
-        cached_info, cached_odds, cached_supp, cache_hit, remaining = get_cached_data(date_str, race_no)
+        # キャッシュ確認
+        cached_info, cached_odds, cached_extra, cache_hit, remaining = get_cached_data(
+            date_str, race_no
+        )
 
         if cache_hit:
             st.session_state["race_info"] = cached_info
             st.session_state["odds"] = cached_odds
-            st.session_state["supplement"] = cached_supp
+            st.session_state["extra_data"] = cached_extra
             st.session_state["race_no"] = race_no
-            st.success(f"第{race_no}R のデータをキャッシュから取得しました（残り {remaining} 秒）")
+            source = cached_extra.get("source", "cache")
+            st.success(f"第{race_no}R キャッシュから取得（残り {remaining}秒 / ソース: {source}）")
         else:
-            with st.spinner("boatrace.jp からデータ取得中..."):
-                race_info = fetch_race_list(date_str, race_no)
+            with st.spinner("データ取得中... (heiwajima.gr.jp → boatrace.jp)"):
+                race_info, odds, extra_data = unified_fetch_race(date_str, race_no)
+
                 if race_info and race_info.racers:
-                    race_info = fetch_before_info(date_str, race_no, race_info)
-                    odds = fetch_odds_3t(date_str, race_no)
+                    # 舟券種別に応じたオッズを追加取得
+                    bet_key = bet_type_map[bet_type_label]
+                    if bet_key != "3t" or not odds:
+                        additional_odds = unified_fetch_odds(
+                            date_str, race_no, bet_key,
+                        )
+                        if additional_odds:
+                            odds = additional_odds
 
-                    # 平和島公式サイトから追加データ
-                    supplement = None
-                    if use_heiwajima and fetch_heiwajima_supplement:
-                        try:
-                            supplement = fetch_heiwajima_supplement(date_str, race_no)
-                            if supplement and supplement.success:
-                                st.info("平和島公式サイトから追加データを取得しました")
-                        except Exception:
-                            supplement = None
-
-                    set_cache(date_str, race_no, race_info, odds, supplement)
+                    set_cache(date_str, race_no, race_info, odds, extra_data)
                     st.session_state["race_info"] = race_info
                     st.session_state["odds"] = odds
-                    st.session_state["supplement"] = supplement
+                    st.session_state["extra_data"] = extra_data
                     st.session_state["race_no"] = race_no
 
-                    odds_msg = f"（オッズ {len(odds)} 件取得）" if odds else "（オッズ取得失敗 - デモオッズ使用）"
-                    st.success(f"第{race_no}R のデータを取得しました {odds_msg}")
+                    source = extra_data.get("source", "unknown")
+                    source_label = {
+                        "heiwajima": "平和島公式",
+                        "boatrace": "BOAT RACE公式",
+                    }.get(source, source)
+                    odds_msg = f"オッズ {len(odds)}件" if odds else "オッズ未取得"
+                    st.success(f"第{race_no}R データ取得完了（{source_label} / {odds_msg}）")
+
                     if debug_mode and debug_racelist_html:
                         st.session_state["debug_html"] = debug_racelist_html(date_str, race_no)
                 else:
@@ -288,22 +339,38 @@ with col2:
                         "デモデータを表示します。"
                     )
                     st.session_state["race_info"] = _create_demo_data(race_no, date_str)
-                    st.session_state["odds"] = _create_demo_odds()
-                    st.session_state["supplement"] = None
+                    st.session_state["odds"] = _create_demo_odds(bet_type_label)
+                    st.session_state["extra_data"] = {"source": "demo"}
                     st.session_state["race_no"] = race_no
 
     # レース情報表示
     if "race_info" in st.session_state:
         race_info_display: RaceInfo = st.session_state["race_info"]
         odds_dict_display: dict = st.session_state.get("odds", {})
+        extra_data_display: dict = st.session_state.get("extra_data", {})
 
-        st.subheader(f"第{race_info_display.race_no}R {race_info_display.race_name}")
+        # ソース表示
+        source = extra_data_display.get("source", "")
+        source_html = ""
+        if source == "heiwajima":
+            source_html = '<span class="source-tag source-heiwajima">平和島公式</span>'
+        elif source == "boatrace":
+            source_html = '<span class="source-tag source-boatrace">BOAT RACE公式</span>'
+        elif source == "demo":
+            source_html = '<span class="source-tag source-demo">デモ</span>'
+
+        st.markdown(
+            f"### 第{race_info_display.race_no}R {race_info_display.race_name} {source_html}",
+            unsafe_allow_html=True,
+        )
         if race_info_display.deadline:
             st.caption(f"締切: {race_info_display.deadline}")
 
         if race_info_display.racers:
             rows = []
-            supplement_data = st.session_state.get("supplement")
+            course_entry = extra_data_display.get("course_entry", {})
+            exhibit_st = extra_data_display.get("exhibit_st", {})
+
             for r in race_info_display.racers:
                 row_data = {
                     "枠": f"{get_waku_color(r.waku)} {r.waku}",
@@ -315,13 +382,33 @@ with col2:
                     "ボート2連": f"{r.boat_2r:.1f}%" if r.boat_2r else "-",
                     "展示T": f"{r.exhibit_time:.2f}" if r.exhibit_time else "-",
                 }
-                # 平和島追加データ
-                if supplement_data and supplement_data.success:
-                    if supplement_data.exhibit_st and r.waku in supplement_data.exhibit_st:
-                        row_data["展示ST"] = f"{supplement_data.exhibit_st[r.waku]:.2f}"
-                    if supplement_data.course_entry and r.waku in supplement_data.course_entry:
-                        course = supplement_data.course_entry[r.waku]
-                        row_data["進入"] = f"{course}コース" if course != r.waku else "枠なり"
+
+                # 展示ST
+                racer_st = getattr(r, "exhibit_st", 0.0) or 0.0
+                if not racer_st and r.waku in exhibit_st:
+                    racer_st = exhibit_st[r.waku]
+                if racer_st:
+                    row_data["展示ST"] = f"{racer_st:.2f}"
+
+                # 進入コース
+                racer_course = getattr(r, "course_entry", 0) or 0
+                if not racer_course and r.waku in course_entry:
+                    racer_course = course_entry.get(r.waku, 0)
+                if racer_course and racer_course != r.waku:
+                    row_data["進入"] = f"{racer_course}コース"
+                elif racer_course:
+                    row_data["進入"] = "枠なり"
+
+                # 平均ST
+                avg_st = getattr(r, "avg_start_timing", 0.0) or 0.0
+                if avg_st > 0:
+                    row_data["平均ST"] = f"{avg_st:.2f}"
+
+                # F/L
+                f_count = getattr(r, "flying_count", 0) or 0
+                l_count = getattr(r, "late_count", 0) or 0
+                if f_count or l_count:
+                    row_data["F/L"] = f"F{f_count} L{l_count}"
 
                 rows.append(row_data)
 
@@ -331,26 +418,28 @@ with col2:
             # 水面情報
             w = race_info_display.weather
             if w.weather or w.wind_speed or w.wave_height:
-                weather_cols = st.columns(4)
+                weather_cols = st.columns(5)
                 weather_cols[0].metric("天候", w.weather or "-")
                 weather_cols[1].metric("風速", f"{w.wind_speed}m" if w.wind_speed else "-")
                 weather_cols[2].metric("波高", f"{w.wave_height}cm" if w.wave_height else "-")
                 weather_cols[3].metric("気温", f"{w.temperature}℃" if w.temperature else "-")
+                weather_cols[4].metric("水温", f"{w.water_temp}℃" if w.water_temp else "-")
 
     # デバッグ表示
     if debug_mode and "debug_html" in st.session_state:
-        with st.expander("HTML構造デバッグ", expanded=True):
+        with st.expander("HTML構造デバッグ", expanded=False):
             for item in st.session_state["debug_html"]:
                 is_racer = item.get("is_racer", False)
                 marker = "RACER" if is_racer else "SKIP"
-                st.markdown(f"**tbody[{item.get('tbody_index')}]** [{marker}] - td数: {item.get('td_count')}, 勝率数: {item.get('rates_count')}, 4桁番号: {item.get('has_4digit')}")
-                st.text(f"  テキスト: {item.get('td_texts')}")
-                st.text(f"  クラス:   {item.get('td_classes')}")
+                st.markdown(
+                    f"**tbody[{item.get('tbody_index')}]** [{marker}] "
+                    f"td数: {item.get('td_count')}, 勝率数: {item.get('rates_count')}"
+                )
 
 st.divider()
 
 # ── 予測＆買い目提案セクション ──
-st.subheader("💰 3連単 買い目提案")
+st.subheader(f"💰 {bet_type_label} 買い目提案")
 
 budget_col, btn_col = st.columns([2, 1])
 with budget_col:
@@ -365,14 +454,11 @@ with btn_col:
 if predict_btn and "race_info" in st.session_state:
     race_info_pred: RaceInfo = st.session_state["race_info"]
     odds_dict_pred: dict = st.session_state.get("odds", {})
-    supplement_pred = st.session_state.get("supplement")
+    extra_data_pred: dict = st.session_state.get("extra_data", {})
 
-    # heiwajima 補完データの展開
-    course_entry = None
-    exhibit_st = None
-    if supplement_pred and supplement_pred.success:
-        course_entry = supplement_pred.course_entry
-        exhibit_st = supplement_pred.exhibit_st
+    # 進入コース・展示ST
+    course_entry = extra_data_pred.get("course_entry") or None
+    exhibit_st = extra_data_pred.get("exhibit_st") or None
 
     with st.spinner("予測計算中..."):
         # 1着確率を予測
@@ -390,45 +476,68 @@ if predict_btn and "race_info" in st.session_state:
 
         st.divider()
 
-        # 3連単確率を予測（安定重視なら上位多めに計算）
+        # 舟券種別に応じた確率予測
         top_n = 120 if strategy_map[strategy] == "conservative" else 60
-        trifecta_probs = predict_trifecta_probabilities(
-            race_info_pred, top_n=top_n,
-            course_entry=course_entry, exhibit_st=exhibit_st,
-        )
+
+        if bet_type_label == "3連単":
+            combo_probs = predict_trifecta_probabilities(
+                race_info_pred, top_n=top_n,
+                course_entry=course_entry, exhibit_st=exhibit_st,
+            )
+        elif bet_type_label == "2連単":
+            combo_probs = predict_exacta_probabilities(
+                race_info_pred, top_n=min(top_n, 30),
+                course_entry=course_entry, exhibit_st=exhibit_st,
+            )
+        elif bet_type_label == "2連複":
+            combo_probs = predict_quinella_probabilities(
+                race_info_pred, top_n=15,
+                course_entry=course_entry, exhibit_st=exhibit_st,
+            )
+        else:
+            combo_probs = []
+
+        # オッズの確認・フォールバック
+        if not odds_dict_pred:
+            # 舟券種別に応じたオッズを再取得
+            bet_key = bet_type_map[bet_type_label]
+            odds_dict_pred = unified_fetch_odds(date_str, race_no, bet_key)
 
         if not odds_dict_pred:
             st.warning("オッズデータを取得できませんでした。デモオッズで計算します。")
-            odds_dict_pred = _create_demo_odds()
+            odds_dict_pred = _create_demo_odds(bet_type_label)
 
         # 買い目最適化
         plan = optimize_bets(
-            trifecta_probs=trifecta_probs,
+            trifecta_probs=combo_probs,
             odds_dict=odds_dict_pred,
             budget=budget,
             strategy=strategy_map[strategy],
-            bet_type="3連単",
+            bet_type=bet_type_label,
             kelly_frac=0.5,
         )
         plan.race_no = race_info_pred.race_no
 
         # 結果表示
         if plan.suggestions:
-            st.markdown(f"**戦略: {strategy} / 3連単**")
+            st.markdown(f"**戦略: {strategy} / {bet_type_label}**")
 
-            # リスク評価の表示
+            # リスク評価
             if "低リスク" in plan.risk_label:
                 risk_class = "risk-low"
             elif "中リスク" in plan.risk_label:
                 risk_class = "risk-mid"
             else:
                 risk_class = "risk-high"
-            st.markdown(f'リスク評価: <span class="{risk_class}">{plan.risk_label}</span>', unsafe_allow_html=True)
+            st.markdown(
+                f'リスク評価: <span class="{risk_class}">{plan.risk_label}</span>',
+                unsafe_allow_html=True,
+            )
 
-            rows = []
+            result_rows = []
             for s in plan.suggestions:
                 ev_icon = "🟢" if s.expected_value >= 1.0 else "🔴"
-                rows.append({
+                result_rows.append({
                     "買い目": s.combo,
                     "オッズ": f"{s.odds:.1f}倍",
                     "予測確率": f"{s.predicted_prob:.1%}",
@@ -436,7 +545,7 @@ if predict_btn and "race_info" in st.session_state:
                     "配分金額": f"¥{s.bet_amount:,}",
                 })
 
-            df_result = pd.DataFrame(rows)
+            df_result = pd.DataFrame(result_rows)
             st.dataframe(df_result, use_container_width=True, hide_index=True)
 
             # サマリー
@@ -448,7 +557,10 @@ if predict_btn and "race_info" in st.session_state:
 
             # 戦略別アドバイス
             if plan.combined_hit_rate >= 0.5:
-                st.success("合成的中率50%以上 - 安定的な買い目構成です。長期的にプラス収支が期待できます。")
+                st.success(
+                    "合成的中率50%以上 - 安定的な買い目構成です。"
+                    "長期的にプラス収支が期待できます。"
+                )
             elif plan.combined_hit_rate >= 0.3:
                 st.info("合成的中率30-50% - バランスの取れた買い目です。")
             else:
@@ -457,19 +569,21 @@ if predict_btn and "race_info" in st.session_state:
                     "「安定重視」戦略への変更を検討してください。"
                 )
 
-            # 取得データの詳細（デバッグ用）
+            # デバッグ詳細
             if debug_mode:
                 with st.expander("予測詳細"):
+                    st.write(f"データソース: {extra_data_pred.get('source', 'N/A')}")
                     st.write(f"オッズ取得数: {len(odds_dict_pred)}")
-                    st.write(f"3連単確率計算数: {len(trifecta_probs)}")
-                    if supplement_pred:
-                        st.write(f"平和島追加データ: {'成功' if supplement_pred.success else '失敗'}")
-                        if supplement_pred.exhibit_st:
-                            st.write(f"展示ST: {supplement_pred.exhibit_st}")
-                        if supplement_pred.course_entry:
-                            st.write(f"進入コース: {supplement_pred.course_entry}")
+                    st.write(f"確率計算数: {len(combo_probs)}")
+                    if course_entry:
+                        st.write(f"進入コース: {course_entry}")
+                    if exhibit_st:
+                        st.write(f"展示ST: {exhibit_st}")
         else:
-            st.warning("期待値の高い買い目が見つかりませんでした。別の戦略をお試しください。")
+            st.warning(
+                "期待値の高い買い目が見つかりませんでした。"
+                "別の戦略や舟券種別をお試しください。"
+            )
 
 elif predict_btn:
     st.warning("先に「データ取得」ボタンでレースデータを取得してください。")

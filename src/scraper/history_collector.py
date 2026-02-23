@@ -265,8 +265,11 @@ def collect_date_range(start_date: str, end_date: str, output_path: Path | None 
             f"w{w}_name", f"w{w}_register_no", f"w{w}_rank",
             f"w{w}_win_rate_all", f"w{w}_win_rate_2r_all",
             f"w{w}_win_rate_local", f"w{w}_win_rate_2r_local",
-            f"w{w}_motor_2r", f"w{w}_boat_2r",
-            f"w{w}_exhibit_time",
+            f"w{w}_motor_2r", f"w{w}_motor_3r",
+            f"w{w}_boat_2r", f"w{w}_boat_3r",
+            f"w{w}_exhibit_time", f"w{w}_exhibit_st",
+            f"w{w}_avg_start_timing",
+            f"w{w}_flying_count", f"w{w}_late_count",
         ])
 
     start = datetime.strptime(start_date, "%Y%m%d")

@@ -35,7 +35,7 @@ class TestBuildRacerFeatures:
 
         assert features["waku"] == 1
         assert features["win_rate_all"] == 6.5
-        assert features["rank_score"] == 4  # A1
+        assert features["rank_score"] == 4.0  # A1
         assert features["course_base_win_rate"] == HEIWAJIMA_COURSE_WIN_RATE[1]
 
     def test_all_waku_have_course_win_rate(self):
