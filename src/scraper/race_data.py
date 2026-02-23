@@ -1,0 +1,297 @@
+"""boatrace.jp から出走表・直前情報を取得するスクレイパー"""
+
+import re
+from dataclasses import dataclass, field
+from bs4 import BeautifulSoup
+
+from .client import fetch_page, CONFIG
+
+VENUE_CODE = CONFIG["app"]["venue_code"]
+
+
+@dataclass
+class Racer:
+    """出走選手の情報"""
+    waku: int = 0            # 枠番 (1-6)
+    name: str = ""           # 選手名
+    register_no: str = ""    # 登番
+    rank: str = ""           # 級別 (A1/A2/B1/B2)
+    branch: str = ""         # 支部
+    age: int = 0
+    weight: float = 0.0
+    win_rate_all: float = 0.0   # 全国勝率
+    win_rate_2r_all: float = 0.0  # 全国2連率
+    win_rate_local: float = 0.0  # 当地勝率
+    win_rate_2r_local: float = 0.0  # 当地2連率
+    motor_no: int = 0        # モーター番号
+    motor_2r: float = 0.0    # モーター2連率
+    boat_no: int = 0         # ボート番号
+    boat_2r: float = 0.0     # ボート2連率
+    # 直前情報
+    exhibit_time: float = 0.0   # 展示タイム
+    tilt: float = 0.0         # チルト角度
+    start_timing: float = 0.0  # スタートタイミング
+
+
+@dataclass
+class WeatherInfo:
+    """水面気象情報"""
+    weather: str = ""       # 天候
+    wind_direction: str = ""  # 風向
+    wind_speed: int = 0     # 風速 (m/s)
+    wave_height: int = 0    # 波高 (cm)
+    temperature: float = 0.0  # 気温
+    water_temp: float = 0.0  # 水温
+
+
+@dataclass
+class RaceInfo:
+    """1レースの情報"""
+    race_no: int = 0
+    race_name: str = ""
+    date: str = ""           # YYYYMMDD
+    deadline: str = ""       # 締切時刻
+    racers: list[Racer] = field(default_factory=list)
+    weather: WeatherInfo = field(default_factory=WeatherInfo)
+
+
+def _safe_float(text: str) -> float:
+    try:
+        return float(re.sub(r"[^\d.\-]", "", text.strip()))
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def _safe_int(text: str) -> int:
+    try:
+        return int(re.sub(r"[^\d]", "", text.strip()))
+    except (ValueError, AttributeError):
+        return 0
+
+
+def fetch_race_list(date: str, race_no: int) -> RaceInfo | None:
+    """出走表を取得する
+
+    Args:
+        date: YYYYMMDD形式の日付
+        race_no: レース番号 (1-12)
+    """
+    html = fetch_page(
+        "/owpc/pc/race/racelist",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+    info = RaceInfo(race_no=race_no, date=date)
+
+    # レース名
+    title_el = soup.select_one(".heading2_titleName, .title12__title")
+    if title_el:
+        info.race_name = title_el.get_text(strip=True)
+
+    # 締切時刻
+    deadline_el = soup.select_one(".heading2_titleDetail, .title12__time")
+    if deadline_el:
+        info.deadline = deadline_el.get_text(strip=True)
+
+    # 各艇の選手情報をパース
+    tbody_list = soup.select("table.is-w748 tbody, table.is-w495 tbody, .table1 tbody")
+    for i, tbody in enumerate(tbody_list[:6]):
+        racer = Racer(waku=i + 1)
+        tds = tbody.select("td")
+        if not tds:
+            continue
+
+        # 選手名
+        name_el = tbody.select_one(".is-fs18, .is-fs14, a")
+        if name_el:
+            racer.name = re.sub(r"\s+", "", name_el.get_text(strip=True))
+
+        # テキストから数値を抽出
+        all_text = [td.get_text(strip=True) for td in tds]
+        text_joined = " ".join(all_text)
+
+        # 登番を探す
+        reg_match = re.search(r"(\d{4})", text_joined)
+        if reg_match:
+            racer.register_no = reg_match.group(1)
+
+        # 級別を探す
+        rank_match = re.search(r"(A1|A2|B1|B2)", text_joined)
+        if rank_match:
+            racer.rank = rank_match.group(1)
+
+        # 支部を探す
+        branch_match = re.search(r"(東京|大阪|愛知|福岡|群馬|埼玉|千葉|静岡|長崎|山口|広島|徳島|香川|岡山|三重|滋賀|福井|佐賀|長崎)", text_joined)
+        if branch_match:
+            racer.branch = branch_match.group(1)
+
+        # 年齢・体重
+        age_weight = re.findall(r"(\d{2,3})", text_joined)
+
+        # 勝率を探す（小数点を含む数値）
+        rates = re.findall(r"(\d+\.\d{2})", text_joined)
+        if len(rates) >= 4:
+            racer.win_rate_all = _safe_float(rates[0])
+            racer.win_rate_2r_all = _safe_float(rates[1])
+            racer.win_rate_local = _safe_float(rates[2])
+            racer.win_rate_2r_local = _safe_float(rates[3])
+        elif len(rates) >= 2:
+            racer.win_rate_all = _safe_float(rates[0])
+            racer.win_rate_2r_all = _safe_float(rates[1])
+
+        # モーター2連率・ボート2連率
+        if len(rates) >= 6:
+            racer.motor_2r = _safe_float(rates[4])
+            racer.boat_2r = _safe_float(rates[5])
+
+        info.racers.append(racer)
+
+    return info
+
+
+def fetch_before_info(date: str, race_no: int, race_info: RaceInfo | None = None) -> RaceInfo | None:
+    """直前情報（展示タイム・気象）を取得する"""
+    html = fetch_page(
+        "/owpc/pc/race/beforeinfo",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return race_info
+
+    soup = BeautifulSoup(html, "lxml")
+
+    if race_info is None:
+        race_info = RaceInfo(race_no=race_no, date=date)
+
+    # 水面気象情報
+    weather = WeatherInfo()
+
+    weather_section = soup.select_one(".weather1, .weatherBody")
+    if weather_section:
+        items = weather_section.select(".weather1_body, .weatherBody__item, span")
+        text = weather_section.get_text()
+
+        # 天候
+        w_match = re.search(r"(晴|曇り?|雨|雪|霧)", text)
+        if w_match:
+            weather.weather = w_match.group(1)
+
+        # 風速
+        ws_match = re.search(r"(\d+)\s*m", text)
+        if ws_match:
+            weather.wind_speed = _safe_int(ws_match.group(1))
+
+        # 波高
+        wh_match = re.search(r"(\d+)\s*cm", text)
+        if wh_match:
+            weather.wave_height = _safe_int(wh_match.group(1))
+
+        # 気温
+        temp_match = re.search(r"気温\s*(\d+\.?\d*)", text)
+        if temp_match:
+            weather.temperature = _safe_float(temp_match.group(1))
+
+        # 水温
+        wtemp_match = re.search(r"水温\s*(\d+\.?\d*)", text)
+        if wtemp_match:
+            weather.water_temp = _safe_float(wtemp_match.group(1))
+
+    race_info.weather = weather
+
+    # 展示タイム
+    exhibit_section = soup.select(".table1 tbody tr, table tbody tr")
+    time_pattern = re.compile(r"\d+\.\d{2}")
+    for row in exhibit_section:
+        tds = row.select("td")
+        if not tds:
+            continue
+        text = row.get_text()
+        times = time_pattern.findall(text)
+        # 枠番を検出
+        waku_match = re.search(r"^(\d)", tds[0].get_text(strip=True))
+        if waku_match and times:
+            waku = int(waku_match.group(1))
+            if 1 <= waku <= 6 and waku <= len(race_info.racers):
+                race_info.racers[waku - 1].exhibit_time = _safe_float(times[-1])
+
+    return race_info
+
+
+def fetch_odds_3t(date: str, race_no: int) -> dict[str, float]:
+    """3連単オッズを取得する
+
+    Returns:
+        {"1-2-3": 12.5, "1-2-4": 18.3, ...} の形式
+    """
+    html = fetch_page(
+        "/owpc/pc/race/odds3t",
+        params={"hd": date, "jcd": VENUE_CODE, "rno": str(race_no)},
+    )
+    if not html:
+        return {}
+
+    soup = BeautifulSoup(html, "lxml")
+    odds_dict: dict[str, float] = {}
+
+    odds_tables = soup.select("table.is-w495, table.oddsTable, .table1 table")
+    for table in odds_tables:
+        rows = table.select("tr")
+        for row in rows:
+            tds = row.select("td")
+            for td in tds:
+                text = td.get_text(strip=True)
+                # "1-2-3" のような組番とオッズが含まれるパターン
+                combo_match = re.search(r"(\d)-(\d)-(\d)", text)
+                if combo_match:
+                    combo = f"{combo_match.group(1)}-{combo_match.group(2)}-{combo_match.group(3)}"
+                    # 同じtdまたは隣接tdからオッズを取得
+                    odds_text = re.search(r"([\d,]+\.\d+)", text)
+                    if odds_text:
+                        odds_val = _safe_float(odds_text.group(1).replace(",", ""))
+                        if odds_val > 0:
+                            odds_dict[combo] = odds_val
+
+    # 別のHTMLパターン: オッズが別のtdにある場合
+    if not odds_dict:
+        all_tds = soup.select("td.oddsPoint, td.odds-item")
+        for td in all_tds:
+            label = td.get("data-id", "")
+            if re.match(r"\d-\d-\d", label):
+                odds_val = _safe_float(td.get_text(strip=True).replace(",", ""))
+                if odds_val > 0:
+                    odds_dict[label] = odds_val
+
+    return odds_dict
+
+
+def fetch_today_race_count(date: str) -> list[int]:
+    """今日の平和島の開催レース番号一覧を取得する"""
+    html = fetch_page(
+        "/owpc/pc/race/index",
+        params={"hd": date, "jcd": VENUE_CODE},
+    )
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    race_numbers = []
+
+    # レース番号のリンクを探す
+    links = soup.select("a[href]")
+    for link in links:
+        href = link.get("href", "")
+        if f"jcd={VENUE_CODE}" in href or "jcd=04" in href:
+            rno_match = re.search(r"rno=(\d+)", href)
+            if rno_match:
+                rno = int(rno_match.group(1))
+                if 1 <= rno <= 12 and rno not in race_numbers:
+                    race_numbers.append(rno)
+
+    if not race_numbers:
+        # デフォルト: 通常開催は12R
+        return list(range(1, 13))
+
+    return sorted(race_numbers)
